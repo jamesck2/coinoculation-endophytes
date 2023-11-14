@@ -416,7 +416,7 @@ write.csv(cont, "./treated/m3_cont.csv", row.names = FALSE)
                               expression(Co- ~italic("Pa. ")~522),
                               expression(Co- ~italic("Ps. ")~"702A"),
                               expression(Co- ~italic("Pa. ")~"717A"),
-                              expression(Co- ~italic("Ps. ")~"733A")
+                              expression(Co- ~italic("Ps. ")~"733B")
                               )
                    ) +
   labs(x = "Inoculation treatment", y = "Shoot biomass (mg)") +
@@ -467,7 +467,7 @@ write.csv(cont, "./treated/m3_cont.csv", row.names = FALSE)
                               expression(Co- ~italic("Pa. ")~522),
                               expression(Co- ~italic("Ps. ")~"702A"),
                               expression(Co- ~italic("Pa. ")~"717A"),
-                              expression(Co- ~italic("Ps. ")~"733A")
+                              expression(Co- ~italic("Ps. ")~"733B")
                               )
                    ) +
   labs(x = "Inoculation treatment", y = "Nodule number (no.)") +
