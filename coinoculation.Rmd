@@ -24,6 +24,7 @@ library("lme4") # linear mixed models
 library("lmerTest") ## model selection
 library("car") # ANOVA function for linear mixed models
 library("gridExtra") # for arranging plots
+library("cowplot")
 ```
 
 ## Greenhouse experiment (Summer 2021)
@@ -508,7 +509,7 @@ fig <- plot_grid(p1, p2,
           labels = c("A","B"))
 
 ## save plot
-save_plot("./treated/Fig1.png", fig,
+save_plot("./treated/Fig2.png", fig,
           ncol = 1, 
           nrow = 2,
           base_aspect_ratio = 2.5)
@@ -555,7 +556,7 @@ ggplot(Nadd.r, aes(x = N.add, y = ShootMass, color = Inoc)) +
         panel.grid.minor = element_blank())
 )
 ### save
-  save_plot("./Nadd/Fig2.png", p,
+  save_plot("./Nadd/Fig3.png", p,
           ncol = 1, 
           nrow = 1,
           base_aspect_ratio = 1.3)

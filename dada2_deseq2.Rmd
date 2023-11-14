@@ -1,0 +1,1221 @@
+---
+title: "16S V3-V4 amplicon sequencing (Fluidigm) of root nodule endosphere from <i>M. truncatula</i> DZA co-inoculated with <i>S. meliloti</i> MAG141 and either <i>Paenibacillus</i> sp. MAG717A or <i>Pseudomonas</i> sp. MAG733B." 
+author: "JC Kosmopoulos"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+```{r Load packages, message=FALSE, warning=FALSE}
+# global options
+knitr::opts_chunk$set(echo = TRUE)
+# set working directory
+setwd("../coinoculation-endophytes")
+```
+
+# Preface
+This markdown follows the [DADA2 Pipeline Tutorial (1.16)](https://benjjneb.github.io/dada2/tutorial.html) (Benjamin Callahan) and sometimes code, comments, and text are entirely copied from the tutorial and pasted here. Modifications were made for these data and this study. Further down, I start a differential abundance analysis with [DESeq2](https://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html). The workflow I follow is also derived from [this tutorial](https://hbctraining.github.io/DGE_workshop_salmon_online/) by Meeta Mistry, Mary Piper, Jihe Liu, and Radhika Khetani (2021).
+
+# DADA2 pipeline with my amplicon data
+Here I will import my forward and reverse reads from the Fluidigm_2020121 V3-V4 amplicon data to DADA2. Reads are already demultiplexed by the sequencing center.
+
+## Getting started
+
+Load packages
+
+```{r}
+library(dada2); packageVersion("dada2") # for ASV sample inference
+library(cowplot); packageVersion("cowplot") # for plotting
+library(phyloseq); packageVersion("phyloseq") # to create sequence objects
+library(DECIPHER); packageVersion("DECIPHER") # for assigning taxonomy
+library(Biostrings); packageVersion("Biostrings") # for manipulating sequences
+library(tidyverse); packageVersion("tidyverse") # includes ggplot2, dplyr, readr, stringr
+library(pheatmap); packageVersion("pheatmap") # to make a pretty heatmap
+library(RColorBrewer); packageVersion("RColorBrewer") # for extra color palettes
+library(viridis); packageVersion("viridis") # for extra color palettes
+library(DESeq2); packageVersion("DESeq2") # for differential abundance analysis
+library(edgeR); packageVersion("edgeR") # normalization tools
+library(ggrepel); packageVersion("ggrepel") # for plots
+```
+
+Define path to reads
+
+```{r}
+path <- "./16S/V3_F357_N_V4_R805" # Change this to the path of your local version of the 16S amplicon .fastq reads
+list.files(path)
+```
+
+Reads representing samples co-inoculated strains MAG522 and MAG702A are located within the folder "excluded_amplicon_samples" and are not included here, since the scope of the paper only pertains to 141, 717A, and 733B.
+
+Now we read in the names of the fastq files, and perform some string manipulation to get matched lists of the forward and reverse fastq files.
+
+```{r}
+# Forward and reverse fastq filenames have format: V3_F357_N_V4_R805-SAMPLENAME_BARCODE_R1.fastq and V3_F357_N_V4_R805-SAMPLENAME_BARCODE_R2.fastq
+fnFs <- sort(list.files(path, pattern="_R1.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2.fastq", full.names = TRUE))
+# Extract sample names, assuming filenames have the above format:
+sample.names <- sapply(strsplit(basename(fnFs), "-"), `[`, 2)
+sample.names <- sapply(strsplit(basename(sample.names), "_R1"), `[`, 1)
+sample.names <- sapply(strsplit(basename(sample.names), "_T"), `[`, 1)
+sample.names <- sapply(strsplit(basename(sample.names), "_A"), `[`, 1)
+sample.names <- sapply(strsplit(basename(sample.names), "_G"), `[`, 1)
+sample.names <- sapply(strsplit(basename(sample.names), "_CA"), `[`, 1)
+sample.names <- sapply(strsplit(basename(sample.names), "_CG"), `[`, 1)
+sample.names <- sapply(strsplit(basename(sample.names), "_CC"), `[`, 1)
+sample.names <- sapply(strsplit(basename(sample.names), "_CTA"), `[`, 1)
+sample.names <- sapply(strsplit(basename(sample.names), "_CTT"), `[`, 1)
+sample.names <- sapply(strsplit(basename(sample.names), "_CTG"), `[`, 1)
+sample.names <- sapply(strsplit(basename(sample.names), "_CTC"), `[`, 1)
+sample.names
+```
+
+## Inspect read quality profiles
+We start by visualizing the quality profiles of the forward reads:
+
+```{r fig.height=12, fig.width=24}
+forward_quality_plots <- plotQualityProfile(fnFs[1:86])
+save_plot("./16S/forward_quality_plots.png", forward_quality_plots, base_height=12, base_width=24)
+forward_quality_plots
+```
+
+In gray-scale is a heat map of the frequency of each quality score at each base position. The mean quality score at each position is shown by the green line, and the quartiles of the quality score distribution by the orange lines. The red line shows the scaled proportion of reads that extend to at least that position (this is more useful for other sequencing technologies, as Illumina reads are typically all the same length, hence the flat red line).
+
+All forward reads seem to be of high quality (except the control samples). Even the end of the sequences all seem to be above or near 30, so I will not truncate the tails.
+
+Now we visualize the quality profile of the reverse reads:
+
+```{r fig.height=12, fig.width=24}
+reverse_quality_plots <- plotQualityProfile(fnRs[1:86])
+save_plot("./16S/reverse_quality_plot.png", reverse_quality_plots, base_height=12, base_width=24)
+reverse_quality_plots
+```
+
+All reverse reads except controls also seem to be of high quality.
+
+## Filter and trim
+Assign the filenames for the filtered fastq.gz files.
+
+```{r}
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+```
+
+### Barcodes and primers
+Sequence reads in <code>file.path</code> were already demultiplexed by the sequencing center, so no barcodes should be present. There are, however, two sets of primers on each read mate. The Fluidigm amplicon structure results in reads with a CS (Fluidigm-specific) primer and the V3-V4 primer. Both need to be removed from each end. According to the sequencing results from the W. M. Keck Center:
+
+```{r}
+fwd16Sprimer <- "CCTACGGGNGGCWGCAG"
+rev16Sprimer <- "GACTACHVGGGTATCTAATCC"
+CS1primer <- "AGACCAAGTCTCTGC"
+CS2primer <- "TGTAGAACCATGTC"
+fwdprimerlen <- nchar(fwd16Sprimer) + nchar(CS1primer)
+revprimerlen <- nchar(rev16Sprimer) + nchar(CS2primer)
+```
+
+
+Filtering parameters:
+The standard filtering parameters (maxN=0 (DADA2 requires no N's), truncQ=2, rm.phix=TRUE and maxEE=2) are starting points, not set in stone. If you want to speed up downstream computation, consider tightening maxEE. If too few reads are passing the filter, consider relaxing maxEE, perhaps especially on the reverse reads (eg. maxEE=c(2,5)), and reducing the truncLen to remove low quality tails. Remember though, when choosing truncLen for paired-end reads you must maintain overlap after truncation in order to merge them later.
+
+```{r}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs,
+              trimLeft = c(fwdprimerlen, revprimerlen), # removes primers (FWD_PRIMER_LEN, REV_PRIMER_LEN)
+              truncLen=c(0,0), # Removes  tails: first number is truncation site for forwards reads, second is for reverse reads
+              maxN=0, # After truncation, sequences with more than maxN Ns will be discarded (dada2 does not allow Ns)
+              maxEE=c(2,5), # Sets the maximum number of “expected errors” allowed in a read (forward, reverse)
+              truncQ=2, # Truncate reads at the first instance of a quality score less than or equal to truncQ
+              # minQ=30, # Only keep reads with a quality score > 30 (high-quality)
+              rm.phix=TRUE,
+              compress=TRUE, verbose=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+out
+```
+
+## Dereplicate 
+The next thing we want to do is “dereplicate” the filtered fastq files. During dereplication, we condense the data by collapsing together all reads that encode the same sequence, which significantly reduces later computation times:
+
+```{r}
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+```
+
+
+Dereplication is a common step in almost all modern ASV inference (or OTU picking) pipelines, but a unique feature of derepFastq is that it maintains a summary of the quality information for each dereplicated sequence in $quals.
+
+## Learn the Error Rates
+The DADA2 algorithm makes use of a parametric error model (err) and every amplicon dataset has a different set of error rates. The learnErrors method learns this error model from the data, by alternating estimation of the error rates and inference of sample composition until they converge on a jointly consistent solution. As in many machine-learning problems, the algorithm must begin with an initial guess, for which the maximum possible error rates in this data are used (the error rates if only the most abundant sequence is correct and all the rest are errors).
+
+```{r}
+errF <- learnErrors(derepFs, multithread=TRUE)
+errR <- learnErrors(derepRs, multithread=TRUE)
+```
+
+Visualize estimated error rates:
+
+```{r}
+plotErrors(errF, nominalQ=TRUE)
+plotErrors(errR, nominalQ=TRUE)
+```
+
+The error rates for each possible transition (A→C, A→G, …) are shown. Points are the observed error rates for each consensus quality score. The black line shows the estimated error rates after convergence of the machine-learning algorithm. The red line shows the error rates expected under the nominal definition of the Q-score. Here the estimated error rates (black line) are a good fit to the observed rates (points), and the error rates drop with increased quality as expected. Everything looks reasonable and we proceed with confidence.
+
+## Sample Inference
+We are now ready to apply the core sample inference algorithm to the filtered and trimmed sequence data.
+
+```{r}
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+saveRDS(dadaFs, file = "./16S/dadaFs.RDS")
+saveRDS(dadaRs, file = "./16S/dadaRs.RDS")
+```
+
+Inspecting the returned dada-class objects:
+
+```{r}
+dadaFs[[1]]
+dadaRs[[1]]
+```
+
+## Load dada-class objects
+```{r}
+readRDS(file = "./16S/dadaFs.RDS")
+readRDS(file = "./16S/dadaRs.RDS")
+```
+
+## Merge paired reads
+We now merge the forward and reverse reads together to obtain the full denoised sequences. Merging is performed by aligning the denoised forward reads with the reverse-complement of the corresponding denoised reverse reads, and then constructing the merged “contig” sequences. By default, merged sequences are only output if the forward and reverse reads overlap by at least 12 bases, and are identical to each other in the overlap region (but these conditions can be changed via function arguments).
+
+```{r}
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+```
+
+The mergers object is a list of data.frames from each sample. Each data.frame contains the merged sequence, its abundance, and the indices of the forward and reverse sequence variants that were merged. Paired reads that did not exactly overlap were removed by mergePairs, further reducing spurious output.
+
+## Construct sequence table
+We can now construct an amplicon sequence variant table (ASV) table, a higher-resolution version of the OTU table produced by traditional methods.
+
+```{r}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+```
+
+The sequence table is a matrix with rows corresponding to (and named by) the samples, and columns corresponding to (and named by) the sequence variants.
+
+## Remove chimeras
+The core dada method corrects substitution and indel errors, but chimeras remain. Fortunately, the accuracy of sequence variants after denoising makes identifying chimeric ASVs simpler than when dealing with fuzzy OTUs. Chimeric sequences are identified if they can be exactly reconstructed by combining a left-segment and a right-segment from two more abundant “parent” sequences.
+
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+
+write.csv(seqtab.nochim, "./16S/sequence_table.csv")
+```
+
+Here chimeras make up about 2% of the merged sequence variants.
+
+## Track reads through the pipeline
+As a final check of our progress, we’ll look at the number of reads that made it through each step in the pipeline:
+
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+track
+```
+
+Looks good! We kept the majority of our raw reads, and there is no over-large drop associated with any single step after filtering.
+
+## Assign taxonomy
+It is common at this point, especially in 16S/18S/ITS amplicon sequencing, to assign taxonomy to the sequence variants. The DADA2 package provides a native implementation of the naive Bayesian classifier method for this purpose. The assignTaxonomy function takes as input a set of sequences to be classified and a training set of reference sequences with known taxonomy, and outputs taxonomic assignments with at least minBoot bootstrap confidence.
+
+The recently developed IdTaxa taxonomic classification method is also available via the DECIPHER Bioconductor package. The paper introducing the IDTAXA algorithm reports classification performance that is better than the long-time standard set by the naive Bayesian classifier. Here we include a code block that allows you to use IdTaxa as a drop-in replacement for assignTaxonomy (and it’s faster as well!). Trained classifiers are available from http://DECIPHER.codes/Downloads.html.
+
+```{r}
+dna <- DNAStringSet(getSequences(seqtab.nochim)) # Create a DNAStringSet from the ASVs
+load("./16S/SILVA_SSU_r138_2019.RData")
+```
+
+```{r}
+ids <- IdTaxa(dna, trainingSet, strand="both", processors=NULL, verbose=FALSE) # use all processors
+ranks <- c("domain", "phylum", "class", "order", "family", "genus", "species") # ranks of interest
+# Convert the output object of class "Taxa" to a matrix analogous to the output from assignTaxonomy
+taxid <- t(sapply(ids, function(x) {
+        m <- match(ranks, x$rank)
+        taxa <- x$taxon[m]
+        taxa[startsWith(taxa, "unclassified_")] <- NA
+        taxa
+}))
+colnames(taxid) <- ranks; rownames(taxid) <- getSequences(seqtab.nochim)
+colnames(taxid) <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+taxid[taxid == "Ensifer"] <- "Sinorhizobium"
+```
+
+```{r}
+taxa <- taxid
+```
+
+# Handoff to phyloseq
+The phyloseq R package is a powerful framework for further analysis of microbiome data.
+
+## Import into phyloseq:
+```{r}
+ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               tax_table(taxa))
+```
+
+It is more convenient to use short names for our ASVs (e.g. ASV21) rather than the full DNA sequence when working with some of the tables and visualizations from phyloseq, but we want to keep the full DNA sequences for other purposes like merging with other datasets or indexing into reference databases like the Earth Microbiome Project. For that reason we’ll store the DNA sequences of our ASVs in the refseq slot of the phyloseq object, and then rename our taxa to a short string. That way, the short new taxa names will appear in tables and plots, and we can still recover the DNA sequences corresponding to each ASV as needed with refseq(ps).
+
+```{r}
+dna <- Biostrings::DNAStringSet(taxa_names(ps))
+names(dna) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, dna)
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+write.csv(otu_table(ps), "./16S/asv_table.csv")
+writeXStringSet(refseq(ps), "./16S/ASV.fasta")
+ps
+```
+
+## Modify dataframe with sample categories
+Using the sample_data function, I can add a dataframe (here, a csv I uploaded named 'metadata') of non-numerical variables to categorize my data even further. To do this, I need to make sure that the rownames are the exact same as the rownames in the otu_table for the phyloseq (ps) object I am adding it to.
+
+Upload and create modified dataframe with categories:
+
+```{r}
+seqtab.sample_data <- read.csv("./16S_metadata.csv")
+seqtab.sample_data2 <- seqtab.sample_data[,-1]
+rownames(seqtab.sample_data2) <- seqtab.sample_data[,1]
+```
+
+Now add it to my phyloseq object:
+
+```{r}
+sample_data(ps) <- seqtab.sample_data2
+```
+
+Remove controls from dataset:
+
+```{r}
+ps <- prune_samples(sample_names(ps) != "KIT_NEG_CTRL", ps)
+ps <- prune_samples(sample_names(ps) != "KIT_NEG_CTRL2", ps)
+ps <- prune_samples(sample_names(ps) != "WATER_NEG_CTRL", ps)
+ps <- prune_samples(sample_names(ps) != "WATER_NEG_CTRL2", ps)
+ps <- prune_samples(sample_names(ps) != "WaterFG", ps)
+ps <- prune_samples(sample_names(ps) != "WaterFG2", ps)
+```
+
+Additionally, there was an error made in labeling two samples. Sample ID "733_8_N_N" in this dataset actually contains data for 733_8_R_S, and sample ID "733-733_8_R_S-R-S" contains data for 733_8_N_N-8-N-N. <i>I.e.</i> the two samples were switched when dispensing DNA into wells before submission. So I wil lwhich the contents of these rows in the <code>sample_data</code> for the <code>ps</code> object:
+
+```{r}
+# Run only ONCE!
+row1_index <- "733_8_N_N"
+row2_index <- "733_8_R_S"
+row1_data <- sample_data(ps)[row1_index, ]
+row2_data <- sample_data(ps)[row2_index, ]
+sample_data(ps)[row1_index, ] <- row2_data
+sample_data(ps)[row2_index, ] <- row1_data
+sample_data(ps)[row1_index, ]
+sample_data(ps)[row2_index, ]
+```
+
+
+## Remove mitochondria and chloroplast families as well as other misc outliers
+
+```{r}
+ps.organelle.rm <- ps
+ps.organelle.rm <- subset_taxa(ps.organelle.rm, Order!="Rickettsiales")
+ps.organelle.rm <- subset_taxa(ps.organelle.rm, Order!="Chloroplast")
+ps.organelle.rm <- subset_taxa(ps.organelle.rm, is.na(Domain) == FALSE)
+```
+
+# Differential abundance with DESeq2
+## Gather abundance data
+```{r}
+ps.organelle.rm.newnames <- ps.organelle.rm
+taxa_names(ps.organelle.rm.newnames) <- paste0(taxa_names(ps.organelle.rm.newnames), " (", data.frame(tax_table(ps.organelle.rm.newnames))$Family, "; ", data.frame(tax_table(ps.organelle.rm.newnames))$Genus, ")")
+counts <- otu_table(ps.organelle.rm.newnames)
+metadata <- sample_data(ps.organelle.rm.newnames)
+metadata <- data.frame(metadata)
+metadata <- subset(metadata, select = -c(Group))
+metadata$Tissue <- factor(metadata$Tissue, levels = c("Root", "Nodule"))
+metadata$Surface <- factor(metadata$Surface, levels = c("Not surface-sterilized", "Surface-sterilized"))
+metadata$Inoculum <- factor(metadata$Inoculum, levels = c("141", "717A + 141", "733B + 141"))
+sampleorder <- row.names(metadata[order(metadata$Inoculum, metadata$Tissue, metadata$Surface), ]) # Set sample order
+metadata <- metadata[sampleorder, ] # Reorder metadata table by sample order
+counts <- counts[sampleorder ,] # Reorder matrix by sample order
+counts <- t(counts) # Transpose matrix to flip rows and columns
+counts <- data.frame(counts) # Convert from OTU table object to dataframe
+colnames(counts) <-  sub("X", "", colnames(counts)) # Remove "X" from beginning of column names that appeared for some reason
+head(counts)
+```
+
+## Count distribution
+I'll plot the distributions of a few samples:
+
+```{r}
+ggplot(counts) +
+  geom_histogram(aes(x = `141_1_N_N`), stat = "bin", bins = 20) +
+  xlab("ASV abundance") +
+  ylab("Number of ASVs") +
+  ggtitle("141_1_N_N")
+
+ggplot(counts) +
+  geom_histogram(aes(x = `717_5_R_S`), stat = "bin", bins = 20) +
+  xlab("ASV abundance") +
+  ylab("Number of ASVs") +
+  ggtitle("717_5_R_S")
+
+ggplot(counts) +
+  geom_histogram(aes(x = `733_9_N_S`), stat = "bin", bins = 20) +
+  xlab("ASV abundance") +
+  ylab("Number of ASVs") +
+  ggtitle("733_9_N_S")
+```
+
+These samples are left-skewed. The [tutorial](https://github.com/hbctraining/DGE_workshop_salmon/blob/master/lessons/01_DGE_setup_and_overview.md) shows a very similar pattern and states, "This plot illustrates some common features of RNA-seq count data: a low number of counts associated with a large proportion of genes, a long right tail due to the lack of any upper limit for expression, large dynamic range." So I guess this is a good sign that this is what the typical input data for DESeq looks like at this stage.
+
+# Creating a DESeq2 object and normalizing counts
+To create a DESeq object from the counts, I need to make sure that the order of column names in the counts table is the same as the order of rownames for the metadata.
+
+```{r}
+# reorder metadata's columns based on row order of the counts  
+metadata <- metadata[colnames(counts), ]
+all(colnames(counts) == rownames(metadata))
+```
+
+Make DESeq object
+
+```{r}
+# Convert 0 values to ones
+counts[counts==0] <- 1 # Convert NA's to pseudo-count 1's for rld
+
+dds <- DESeqDataSetFromMatrix(countData=counts,
+                              colData=metadata,
+                              design= ~Inoculum + Tissue + Surface)
+dds
+```
+
+Once the <code>DESeq()</code> function is used later on, it will use the function <code>estimateSizeFactors()</code> to generate normalized counts, so I do not have to do it manually here.
+
+# Quality control
+To explore the similarity of my samples, I will perform sample-level QC using Principal Component Analysis (PCA) and hierarchical clustering methods. The sample-level QC allows me to see how well the replicates cluster together, as well as, observe whether the experimental condition represents the major source of variation in the data. Performing sample-level QC can also identify any sample outliers, which may need to be explored further to determine whether they need to be removed prior to DE analysis.
+
+## Make a DESeq object just for sample-level QC
+```{r}
+dds_QC <- DESeq(dds, test="LRT", reduced=~1)
+```
+
+## Remove low counts before QC
+```{r}
+dds_filt <- DGEList(counts=counts(dds_QC), group=metadata$Inoculum:metadata$Tissue:metadata$Surface)
+keep <- filterByExpr(dds_filt)
+table(keep)
+```
+
+None of them need to be removed.
+
+# Hypothesis testing
+## Hypothesis 1
+Inoculum does not significantly affect ASV abundances.
+
+Full model: <code>design = ~ Inoculum + Tissue + Surface</code>.
+
+Reduced model: <code>design = ~ Tissue + Surface</code>
+
+### Test
+```{r}
+dds_lrt_full.vs.noInoc <- DESeq(dds, test="LRT", reduced = ~ Tissue + Surface)
+```
+
+### Results
+```{r}
+res_LRT_full.vs.noInoc <- results(dds_lrt_full.vs.noInoc)
+
+# Create a tibble for LRT results
+res_LRT_full.vs.noInoc_tb <- res_LRT_full.vs.noInoc %>%
+  data.frame() %>%
+  rownames_to_column(var="ASV") %>% 
+  as_tibble()
+write.csv(res_LRT_full.vs.noInoc_tb, "./16S/LRT_test_results_Inoc.csv", row.names = F)
+
+# Subset to return ASVs with padj < 0.05
+padj.cutoff <- 0.05 # Set alpha to 0.05
+sigLRT_ASVs_full.vs.noInoc <- res_LRT_full.vs.noInoc_tb %>%
+  filter(padj < padj.cutoff)
+insigLRT_ASVs_full.vs.noInoc <- res_LRT_full.vs.noInoc_tb %>%
+  filter(padj >= padj.cutoff)
+```
+
+### Get the significant ASVs
+```{r}
+sigLRT_ASVs_full.vs.noInoc
+nrow(sigLRT_ASVs_full.vs.noInoc)
+```
+
+### Get number of insignificant ASVs
+```{r}
+insigLRT_ASVs_full.vs.noInoc
+nrow(insigLRT_ASVs_full.vs.noInoc)
+```
+
+### Contrasts: inoculum 717A + 141 vs 141
+#### Get results
+```{r}
+res_inoc_717A_vs_141 <- results(dds_lrt_full.vs.noInoc, contrast = c("Inoculum", "717A + 141", "141"), alpha = 0.05) # Baseline is 141 inoculum
+head(res_inoc_717A_vs_141  %>% as.data.frame())
+```
+
+#### Shrunken log2 foldchanges (LFC)
+```{r}
+# Apply fold change shrinkage
+res_inoc_717A_vs_141 <- lfcShrink(dds_lrt_full.vs.noInoc, coef="Inoculum_717A...141_vs_141")
+res_inoc_717A_vs_141
+```
+
+#### Summarize results
+```{r}
+summary(res_inoc_717A_vs_141, alpha = 0.05)
+```
+
+#### Save results
+```{r}
+res_inoc_717A_vs_141_tb <- res_inoc_717A_vs_141 %>%
+  as.data.frame() %>%
+  rownames_to_column(var="ASV") %>% 
+  as_tibble()
+write.csv(res_inoc_717A_vs_141_tb, "./16S/test_results_Inoc_717A141_vs_141_shrunken_LFC.csv", row.names = F)
+head(res_inoc_717A_vs_141_tb)
+```
+
+#### Extract significant results
+```{r}
+sig_inoc_717A_vs_141 <- res_inoc_717A_vs_141_tb %>% filter(padj < 0.05)
+write.csv(sig_inoc_717A_vs_141, "./16S/significant_results_Inoc_717A141_vs_141_shrunken_LFC.csv", row.names = F)
+sig_inoc_717A_vs_141
+nrow(sig_inoc_717A_vs_141)
+```
+
+### Contrasts: inoculum 733B + 141 vs 141
+Of the ASVs whose abundances are significantly affected by inoculum, which ones are differentially abundant in the 733B + 141 inoculua compared to the baseline 141 inoculum? 
+
+#### Get results
+```{r}
+res_inoc_733B_vs_141 <- results(dds_lrt_full.vs.noInoc, contrast = c("Inoculum", "733B + 141", "141"), alpha = 0.05) # Baseline is 141 inoculum
+head(res_inoc_733B_vs_141  %>% as.data.frame())
+```
+
+#### Shrunken log2 foldchanges (LFC)
+```{r}
+# Apply fold change shrinkage
+res_inoc_733B_vs_141 <- lfcShrink(dds_lrt_full.vs.noInoc, coef="Inoculum_733B...141_vs_141")
+res_inoc_733B_vs_141
+```
+
+#### Summarize results
+```{r}
+summary(res_inoc_733B_vs_141, alpha = 0.05)
+```
+
+#### Save results
+```{r}
+res_inoc_733B_vs_141_tb <- res_inoc_733B_vs_141 %>%
+  as.data.frame() %>%
+  rownames_to_column(var="ASV") %>% 
+  as_tibble()
+write.csv(res_inoc_733B_vs_141_tb, "./16S/test_results_Inoc_733B141_vs_141_shrunken_LFC.csv", row.names = F)
+head(res_inoc_733B_vs_141_tb)
+```
+
+#### Extract significant results
+```{r}
+sig_inoc_733B_vs_141 <- res_inoc_733B_vs_141_tb %>% filter(padj < 0.05)
+write.csv(sig_inoc_733B_vs_141, "./16S/significant_results_Inoc_733B141_vs_141_shrunken_LFC.csv", row.names = F)
+sig_inoc_733B_vs_141
+nrow(sig_inoc_733B_vs_141)
+```
+
+### Volcano plot of the ASVs whose abundance are significantly affected by Inoculum
+#### log2 fold changes of 717A + 141 vs 141 contrasts
+##### Obtain a logical vector where TRUE values denote padj values < 0.05 and fold change > 2 in either direction
+log2FoldChange >= 1 since we are working with log2 fold changes so this translates to an actual fold change of 2
+
+```{r}
+res_inoc_717A_vs_141_tb <- res_inoc_717A_vs_141_tb %>% mutate(threshold_717A141 = padj < 0.05 & abs(log2FoldChange) >= 1)
+```
+
+##### Make labels for the ASVs meeting the cutoff
+```{r}
+res_inoc_717A_vs_141_tb$label <- res_inoc_717A_vs_141_tb$ASV
+res_inoc_717A_vs_141_tb$label <- gsub("[A-Za-z]+; ", "", res_inoc_717A_vs_141_tb$label) # Use regex to remove family names from parentheses so it's shorter
+# Function to modify the label based on the ASV column
+modify_label <- function(asv_value, label_value) {
+  if (grepl("\\(NA\\)", label_value)) {
+    asv_text <- gsub(".*?\\((.*?)\\;.*", "\\1", asv_value)
+    modified_label <- gsub("NA", asv_text, label_value)
+    return(modified_label)
+  } else {
+    return(label_value)
+  }
+}
+# Apply the function to create a new_label column
+res_inoc_717A_vs_141_tb$new_label <- mapply(modify_label, res_inoc_717A_vs_141_tb$ASV, res_inoc_717A_vs_141_tb$label)
+## Remove the label if it does not meet the threshold
+res_inoc_717A_vs_141_tb <- res_inoc_717A_vs_141_tb %>% mutate(new_label = case_when(threshold_717A141 == TRUE ~ c(new_label, NULL)))
+# Make labels that is just the ASV name if it meets the threshold
+res_inoc_717A_vs_141_tb$new_label_2 <- gsub(" \\(.*", "", res_inoc_717A_vs_141_tb$ASV)
+## Remove the label if it does not meet the threshold
+res_inoc_717A_vs_141_tb <- res_inoc_717A_vs_141_tb %>% mutate(new_label_2 = case_when(threshold_717A141 == TRUE ~ c(new_label_2, NULL)))
+# Make labels just for the three ASVs of interest
+res_inoc_717A_vs_141_tb <- res_inoc_717A_vs_141_tb %>% mutate(new_label_3 = case_when(ASV == "ASV5 (Pseudomonadaceae; Pseudomonas)" ~ c("ASV5", NULL), ASV == "ASV28 (Bacillaceae; Bacillus)" ~ c("ASV28", NULL), ASV == "ASV1 (Rhizobiaceae; Sinorhizobium)" ~ c("ASV1", NULL)))
+# Add back label as in new_label_2 if it is an ASV of interest
+res_inoc_717A_vs_141_tb$new_label_4 <- res_inoc_717A_vs_141_tb$new_label_2
+res_inoc_717A_vs_141_tb <- res_inoc_717A_vs_141_tb %>% mutate(new_label_4 = ifelse(
+    ASV == "ASV5 (Pseudomonadaceae; Pseudomonas)", 
+    list("ASV5", new_label_2),
+    ifelse(
+      ASV == "ASV28 (Bacillaceae; Bacillus)", 
+      list("ASV28", new_label_2),
+      ifelse(
+        ASV == "ASV1 (Rhizobiaceae; Sinorhizobium)",
+        list("ASV1", new_label_2),
+        new_label_2
+      )
+    )
+  ))
+```
+
+##### Volcano plot
+```{r}
+volcano.inoc_717A_vs_141 <- ggplot(res_inoc_717A_vs_141_tb, aes(x = log2FoldChange, y = -log10(padj))) +
+                              geom_point(aes(colour = threshold_717A141)) +
+                              geom_text_repel(aes(label = new_label_3), max.overlaps = 20, min.segment.length = 0) +
+                              xlab("log2 fold change") + 
+                              ylab("-log10 adjusted p-value") +
+                              theme_linedraw() +
+                              ggtitle("Inoculum: 717A + 141 vs 141") +
+                              theme(legend.position = "none", plot.title = element_text(size = 12))
+volcano.inoc_717A_vs_141
+```
+
+#### log2 fold changes of 733B + 141 vs 141 contrasts
+##### Obtain a logical vector where TRUE values denote padj values < 0.05 and fold change > 2 in either direction
+```{r}
+res_inoc_733B_vs_141_tb <- res_inoc_733B_vs_141_tb %>% mutate(threshold_733B141 = padj < 0.05 & abs(log2FoldChange) >= 1)
+```
+
+##### Make labels for the ASVs meeting the cutoff
+```{r}
+res_inoc_733B_vs_141_tb$label <- res_inoc_733B_vs_141_tb$ASV
+res_inoc_733B_vs_141_tb$label <- gsub("[A-Za-z]+; ", "", res_inoc_733B_vs_141_tb$label) # Use regex to remove family names from parentheses so it's shorter
+# Apply the function to create a new_label column
+res_inoc_733B_vs_141_tb$new_label <- mapply(modify_label, res_inoc_733B_vs_141_tb$ASV, res_inoc_733B_vs_141_tb$label)
+## Remove the label if it does not meet the threshold
+res_inoc_733B_vs_141_tb <- res_inoc_733B_vs_141_tb %>% mutate(new_label = case_when(threshold_733B141 == TRUE ~ c(new_label, NULL)))
+# Make labels that is just the ASV name if it meets the threshold
+res_inoc_733B_vs_141_tb$new_label_2 <- gsub(" \\(.*", "", res_inoc_733B_vs_141_tb$ASV)
+## Remove the label if it does not meet the threshold
+res_inoc_733B_vs_141_tb <- res_inoc_733B_vs_141_tb %>% mutate(new_label_2 = case_when(threshold_733B141 == TRUE ~ c(new_label_2, NULL)))
+# Make labels just for the three ASVs of interest
+res_inoc_733B_vs_141_tb <- res_inoc_733B_vs_141_tb %>% mutate(new_label_3 = case_when(ASV == "ASV5 (Pseudomonadaceae; Pseudomonas)" ~ c("ASV5", NULL), ASV == "ASV28 (Bacillaceae; Bacillus)" ~ c("ASV28", NULL), ASV == "ASV1 (Rhizobiaceae; Sinorhizobium)" ~ c("ASV1", NULL)))
+# Add back label as in new_label_2 if it is an ASV of interest
+res_inoc_733B_vs_141_tb$new_label_4 <- res_inoc_733B_vs_141_tb$new_label_2
+res_inoc_733B_vs_141_tb <- res_inoc_733B_vs_141_tb %>% mutate(new_label_4 = ifelse(
+    ASV == "ASV5 (Pseudomonadaceae; Pseudomonas)", 
+    list("ASV5", new_label_2),
+    ifelse(
+      ASV == "ASV28 (Bacillaceae; Bacillus)", 
+      list("ASV28", new_label_2),
+      ifelse(
+        ASV == "ASV1 (Rhizobiaceae; Sinorhizobium)",
+        list("ASV1", new_label_2),
+        new_label_2
+      )
+    )
+  ))
+```
+
+##### Volcano plot
+```{r}
+volcano.inoc_733B_vs_141 <- ggplot(res_inoc_733B_vs_141_tb, aes(x = log2FoldChange, y = -log10(padj))) +
+                              geom_point(aes(colour = threshold_733B141)) +
+                              geom_text_repel(aes(label = new_label_3), max.overlaps = 20, min.segment.length = 0) +
+                              xlab("log2 fold change") + 
+                              ylab("-log10 adjusted p-value") +
+                              theme_linedraw() +
+                              ggtitle("Inoculum: 733B + 141 vs 141") +
+                              theme(legend.position = "none", plot.title = element_text(size = 12))
+volcano.inoc_733B_vs_141
+```
+
+## Hypothesis 2
+Tissue does not significantly affect ASV abundances.
+
+Full model: <code>design = ~ Inoculum + Tissue + Surface</code>.
+
+Reduced model: <code>design = ~ Inoculum + Surface</code>
+
+### Test
+```{r}
+dds_lrt_full.vs.noTissue <- DESeq(dds, test="LRT", reduced = ~ Inoculum + Surface)
+```
+
+### Results
+```{r}
+res_LRT_full.vs.noTissue <- results(dds_lrt_full.vs.noTissue)
+
+# Create a tibble for LRT results
+res_LRT_full.vs.noTissue_tb <- res_LRT_full.vs.noTissue %>%
+  data.frame() %>%
+  rownames_to_column(var="ASV") %>% 
+  as_tibble()
+write.csv(res_LRT_full.vs.noTissue_tb, "./16S/LRT_test_results_Tissue.csv", row.names = F)
+
+# Subset to return ASVs with padj < 0.05
+padj.cutoff <- 0.05 # Set alpha to 0.05
+sigLRT_ASVs_full.vs.noTissue <- res_LRT_full.vs.noTissue_tb %>%
+  filter(padj < padj.cutoff)
+insigLRT_ASVs_full.vs.noTissue <- res_LRT_full.vs.noTissue_tb %>%
+  filter(padj >= padj.cutoff)
+```
+
+### Get the significant ASVs
+```{r}
+sigLRT_ASVs_full.vs.noTissue
+nrow(sigLRT_ASVs_full.vs.noTissue)
+```
+
+### Get number of insignificant ASVs
+```{r}
+insigLRT_ASVs_full.vs.noTissue
+nrow(insigLRT_ASVs_full.vs.noTissue)
+```
+
+### Contrasts: tissue Nodule vs Root
+The differences in abundance of 39 ASVs across inoculum treatment are significant. Of those 39, which ones are differentially abundant in the Nodule samples compared to the Root samples?
+
+#### Get results
+```{r}
+res_tissue_Nod_vs_Root <- results(dds_lrt_full.vs.noTissue, contrast = c("Tissue", "Nodule", "Root"), alpha = 0.05) # Baseline is Root
+head(res_tissue_Nod_vs_Root  %>% as.data.frame())
+```
+
+#### Shrunken log2 foldchanges (LFC)
+```{r}
+# Apply fold change shrinkage
+res_tissue_Nod_vs_Root <- lfcShrink(dds_lrt_full.vs.noTissue, coef="Tissue_Nodule_vs_Root")
+res_tissue_Nod_vs_Root
+```
+
+#### Summarize results
+```{r}
+summary(res_tissue_Nod_vs_Root, alpha = 0.05)
+```
+
+#### Save results
+```{r}
+res_tissue_Nod_vs_Root_tb <- res_tissue_Nod_vs_Root %>%
+  as.data.frame() %>%
+  rownames_to_column(var="ASV") %>% 
+  as_tibble()
+write.csv(res_tissue_Nod_vs_Root_tb, "./16S/test_results_Tissue_Nodule_vs_Root_shrunken_LFC.csv", row.names = F)
+head(res_tissue_Nod_vs_Root_tb)
+```
+
+#### Extract significant results
+```{r}
+sig_inoc_Nod_vs_Root <- res_tissue_Nod_vs_Root_tb %>% filter(padj < 0.05)
+write.csv(sig_inoc_Nod_vs_Root, "./16S/significant_results_Tissue_Nodule_vs_Root_shrunken_LFC.csv", row.names = F)
+sig_inoc_Nod_vs_Root
+nrow(sig_inoc_Nod_vs_Root)
+```
+
+### Volcano plot of the ASVs whose abundance are significantly affected by Tissue
+#### log2 fold changes of Nodule vs Root contrasts
+##### Obtain a logical vector where TRUE values denote padj values < 0.05 and fold change > 2 in either direction
+```{r}
+res_tissue_Nod_vs_Root_tb <- res_tissue_Nod_vs_Root_tb %>% mutate(threshold_NodRoot = padj < 0.05 & abs(log2FoldChange) >= 1)
+```
+
+##### Make labels for the ASVs meeting the cutoff
+```{r}
+res_tissue_Nod_vs_Root_tb$label <- res_tissue_Nod_vs_Root_tb$ASV
+res_tissue_Nod_vs_Root_tb$label <- gsub("[A-Za-z]+; ", "", res_tissue_Nod_vs_Root_tb$label) # Use regex to remove family names from parentheses so it's shorter
+# Apply the function made above to create a new_label column
+res_tissue_Nod_vs_Root_tb$new_label <- mapply(modify_label, res_tissue_Nod_vs_Root_tb$ASV, res_tissue_Nod_vs_Root_tb$label)
+## Remove the label if it does not meet the threshold
+res_tissue_Nod_vs_Root_tb <- res_tissue_Nod_vs_Root_tb %>% mutate(new_label = case_when(threshold_NodRoot == TRUE ~ c(new_label, NULL)))
+# Make labels that is just the ASV name if it meets the threshold
+res_tissue_Nod_vs_Root_tb$new_label_2 <- gsub(" \\(.*", "", res_tissue_Nod_vs_Root_tb$ASV)
+## Remove the label if it does not meet the threshold
+res_tissue_Nod_vs_Root_tb <- res_tissue_Nod_vs_Root_tb %>% mutate(new_label_2 = case_when(threshold_NodRoot == TRUE ~ c(new_label_2, NULL)))
+# Make labels just for the three ASVs of interest
+res_tissue_Nod_vs_Root_tb <- res_tissue_Nod_vs_Root_tb %>% mutate(new_label_3 = case_when(ASV == "ASV5 (Pseudomonadaceae; Pseudomonas)" ~ c("ASV5", NULL), ASV == "ASV28 (Bacillaceae; Bacillus)" ~ c("ASV28", NULL), ASV == "ASV1 (Rhizobiaceae; Sinorhizobium)" ~ c("ASV1", NULL)))
+# Add back label as in new_label_2 if it is an ASV of interest
+res_tissue_Nod_vs_Root_tb$new_label_4 <- res_tissue_Nod_vs_Root_tb$new_label_2
+res_tissue_Nod_vs_Root_tb <- res_tissue_Nod_vs_Root_tb %>% mutate(new_label_4 = ifelse(
+    ASV == "ASV5 (Pseudomonadaceae; Pseudomonas)", 
+    list("ASV5", new_label_2),
+    ifelse(
+      ASV == "ASV28 (Bacillaceae; Bacillus)", 
+      list("ASV28", new_label_2),
+      ifelse(
+        ASV == "ASV1 (Rhizobiaceae; Sinorhizobium)",
+        list("ASV1", new_label_2),
+        new_label_2
+      )
+    )
+  ))
+```
+
+##### Volcano plot
+```{r}
+volcano.inoc_Nod_vs_Root <- ggplot(res_tissue_Nod_vs_Root_tb, aes(x = log2FoldChange, y = -log10(padj))) +
+                              geom_point(aes(colour = threshold_NodRoot)) +
+                              geom_text_repel(aes(label = new_label_3), max.overlaps = 20, min.segment.length = 0) +
+                              xlab("log2 fold change") + 
+                              ylab("-log10 adjusted p-value") +
+                              theme_linedraw() +
+                              ggtitle("Nodule vs Root") +
+                              theme(legend.position = "none", plot.title = element_text(size = 12))
+volcano.inoc_Nod_vs_Root
+```
+
+## Hypothesis 3
+Surface sterilization does not significantly affect ASV abundances.
+
+Full model: <code>design = ~ Inoculum + Tissue + Surface</code>.
+
+Reduced model: <code>design = ~ Inoculum + Tissue</code>
+
+### Test
+```{r}
+dds_lrt_full.vs.noSurface <- DESeq(dds, test="LRT", reduced = ~ Inoculum + Tissue)
+```
+
+### Results
+```{r}
+res_LRT_full.vs.noSurface <- results(dds_lrt_full.vs.noSurface)
+
+# Create a tibble for LRT results
+res_LRT_full.vs.noSurface_tb <- res_LRT_full.vs.noSurface %>%
+  data.frame() %>%
+  rownames_to_column(var="ASV") %>% 
+  as_tibble()
+write.csv(res_LRT_full.vs.noSurface_tb, "./16S/LRT_test_results_Surface.csv", row.names = F)
+
+# Subset to return ASVs with padj < 0.05
+padj.cutoff <- 0.05 # Set alpha to 0.05
+sigLRT_ASVs_full.vs.noSurface <- res_LRT_full.vs.noSurface_tb %>%
+  filter(padj < padj.cutoff)
+insigLRT_ASVs_full.vs.noSurface <- res_LRT_full.vs.noSurface_tb %>%
+  filter(padj >= padj.cutoff)
+```
+
+### Get the significant ASVs
+```{r}
+sigLRT_ASVs_full.vs.noSurface
+nrow(sigLRT_ASVs_full.vs.noSurface)
+```
+
+### Get number of insignificant ASVs
+```{r}
+insigLRT_ASVs_full.vs.noSurface
+nrow(insigLRT_ASVs_full.vs.noSurface)
+```
+
+### Contrasts: tissue Nodule vs Root
+The differences in abundance of 47 ASVs across inoculum treatment are significant. Of those 47, which ones are differentially abundant in the Nodule samples compared to the Root samples?
+
+#### Get results
+```{r}
+res_tissue_Sterile_vs_Not <- results(dds_lrt_full.vs.noSurface, contrast = c("Surface", "Surface-sterilized", "Not surface-sterilized"), alpha = 0.05) # Baseline is Not surface-sterilized
+head(res_tissue_Sterile_vs_Not  %>% as.data.frame())
+```
+
+#### Shrunken log2 foldchanges (LFC)
+```{r}
+# Apply fold change shrinkage
+res_tissue_Sterile_vs_Not <- lfcShrink(dds_lrt_full.vs.noSurface, coef="Surface_Surface.sterilized_vs_Not.surface.sterilized")
+res_tissue_Sterile_vs_Not
+```
+
+#### Summarize results
+```{r}
+summary(res_tissue_Sterile_vs_Not, alpha = 0.05)
+```
+
+#### Save results
+```{r}
+res_tissue_Sterile_vs_Not_tb <- res_tissue_Sterile_vs_Not %>%
+  as.data.frame() %>%
+  rownames_to_column(var="ASV") %>% 
+  as_tibble()
+write.csv(res_tissue_Sterile_vs_Not_tb, "./16S/test_results_Surface_Sterile_vs_NotSterile_shrunken_LFC.csv", row.names = F)
+head(res_tissue_Sterile_vs_Not_tb)
+```
+
+#### Extract significant results
+```{r}
+sig_inoc_Sterile_vs_Not <- res_tissue_Sterile_vs_Not_tb %>% filter(padj < 0.05)
+write.csv(sig_inoc_Sterile_vs_Not, "./16S/significant_results_Surface_Sterile_vs_NotSterile_shrunken_LFC.csv", row.names = F)
+sig_inoc_Sterile_vs_Not
+nrow(sig_inoc_Sterile_vs_Not)
+```
+
+### Volcano plot of the ASVs whose abundance are significantly affected by Surface
+#### log2 fold changes of Surface-sterile. vs Not surface-sterile. contrasts
+##### Obtain a logical vector where TRUE values denote padj values < 0.05 and fold change > 2 in either direction
+```{r}
+res_tissue_Sterile_vs_Not_tb <- res_tissue_Sterile_vs_Not_tb %>% mutate(threshold_Sterile = padj < 0.05 & abs(log2FoldChange) >= 1)
+```
+
+##### Make labels for the ASVs meeting the cutoff
+```{r}
+res_tissue_Sterile_vs_Not_tb$label <- res_tissue_Sterile_vs_Not_tb$ASV
+res_tissue_Sterile_vs_Not_tb$label <- gsub("[A-Za-z]+; ", "", res_tissue_Sterile_vs_Not_tb$label) # Use regex to remove family names from parentheses so it's shorter
+# Apply the function made above to create a new_label column
+res_tissue_Sterile_vs_Not_tb$new_label <- mapply(modify_label, res_tissue_Sterile_vs_Not_tb$ASV, res_tissue_Sterile_vs_Not_tb$label)
+## Remove the label if it does not meet the threshold
+res_tissue_Sterile_vs_Not_tb <- res_tissue_Sterile_vs_Not_tb %>% mutate(new_label = case_when(threshold_Sterile == TRUE ~ c(new_label, NULL)))
+# Make labels that is just the ASV name if it meets the threshold
+res_tissue_Sterile_vs_Not_tb$new_label_2 <- gsub(" \\(.*", "", res_tissue_Sterile_vs_Not_tb$ASV)
+## Remove the label if it does not meet the threshold
+res_tissue_Sterile_vs_Not_tb <- res_tissue_Sterile_vs_Not_tb %>% mutate(new_label_2 = case_when(threshold_Sterile == TRUE ~ c(new_label_2, NULL)))
+# Make labels just for the three ASVs of interest
+res_tissue_Sterile_vs_Not_tb <- res_tissue_Sterile_vs_Not_tb %>% mutate(new_label_3 = case_when(ASV == "ASV5 (Pseudomonadaceae; Pseudomonas)" ~ c("ASV5", NULL), ASV == "ASV28 (Bacillaceae; Bacillus)" ~ c("ASV28", NULL), ASV == "ASV1 (Rhizobiaceae; Sinorhizobium)" ~ c("ASV1", NULL)))
+# Add back label as in new_label_2 if it is an ASV of interest
+res_tissue_Sterile_vs_Not_tb$new_label_4 <- res_tissue_Sterile_vs_Not_tb$new_label_2
+res_tissue_Sterile_vs_Not_tb <- res_tissue_Sterile_vs_Not_tb %>% mutate(new_label_4 = ifelse(
+    ASV == "ASV5 (Pseudomonadaceae; Pseudomonas)", 
+    list("ASV5", new_label_2),
+    ifelse(
+      ASV == "ASV28 (Bacillaceae; Bacillus)", 
+      list("ASV28", new_label_2),
+      ifelse(
+        ASV == "ASV1 (Rhizobiaceae; Sinorhizobium)",
+        list("ASV1", new_label_2),
+        new_label_2
+      )
+    )
+  ))
+```
+
+##### Volcano plot
+```{r}
+volcano.inoc_Sterile_vs_Not <- ggplot(res_tissue_Sterile_vs_Not_tb, aes(x = log2FoldChange, y = -log10(padj))) +
+                              geom_point(aes(colour = threshold_Sterile)) +
+                              geom_text_repel(aes(label = new_label_3), max.overlaps = 20, min.segment.length = 0) +
+                              xlab("log2 fold change") + 
+                              ylab("-log10 adjusted p-value") +
+                              theme_linedraw() +
+                              ggtitle("Surface-sterilized vs not surface-sterilized") +
+                              theme(legend.position = "none", plot.title = element_text(size = 12))
+volcano.inoc_Sterile_vs_Not
+```
+
+## What about the interaction between Inoculum, Tissue, and Surface?
+I can also model and test the abundances of ASVs as influenced by the interaction of Tissue and Surface. This would be useful because I could contrast groups of ASVs in the same Tissue treatment but different Surface treatments.
+
+### Add an interactions
+```{r}
+dds_interact <- dds
+dds_interact$TissueSurface <- factor(paste0(dds_interact$Tissue, dds_interact$Surface))
+design(dds_interact) <- ~ TissueSurface
+dds_interact <- DESeq(dds_interact)
+```
+
+### Hypothesis 4
+The interactions of Tissue and Surface does not significantly affect ASV abundances.
+
+Full model: <code>design = ~TissueSurface</code>.
+
+Reduced model: <code>design = ~ 1</code> (the intercept)
+
+### Test
+```{r}
+dds_lrt_Interact.vs.Intercept <- DESeq(dds_interact, test="LRT", reduced = ~ 1) # reduced model is just the intercept
+```
+
+### Results
+```{r}
+res_LRT_Interact.vs.Intercept <- results(dds_lrt_Interact.vs.Intercept)
+
+# Create a tibble for LRT results
+res_LRT_Interact.vs.Intercept_tb <- res_LRT_Interact.vs.Intercept %>%
+  data.frame() %>%
+  rownames_to_column(var="ASV") %>% 
+  as_tibble()
+write.csv(res_LRT_Interact.vs.Intercept_tb, "./16S/LRT_test_results_Interact_vs_Intercept.csv", row.names = F)
+
+# Subset to return ASVs with padj < 0.05
+padj.cutoff <- 0.05 # Set alpha to 0.05
+sigLRT_ASVs_Interact.vs.Intercept <- res_LRT_Interact.vs.Intercept_tb %>%
+  filter(padj < padj.cutoff)
+insigLRT_ASVs_Interact.vs.Intercept <- res_LRT_Interact.vs.Intercept_tb %>%
+  filter(padj >= padj.cutoff)
+```
+
+### Get the significant ASVs
+```{r}
+sigLRT_ASVs_Interact.vs.Intercept
+nrow(sigLRT_ASVs_Interact.vs.Intercept)
+```
+
+### Get number of insignificant ASVs
+```{r}
+insigLRT_ASVs_Interact.vs.Intercept
+nrow(insigLRT_ASVs_Interact.vs.Intercept)
+```
+
+### Contrasts: surface-sterilized nodule samples vs not surface-sterilized nodule samples
+#### Get results
+```{r}
+res_interact_Nod_Sterile_vs_Nod_Not <- results(dds_lrt_Interact.vs.Intercept, contrast = c("TissueSurface", "NoduleSurface sterilized", "NoduleNot surface-sterilized"), alpha = 0.05) # Baseline is not surface-sterilized Nodule samples
+head(res_interact_Nod_Sterile_vs_Nod_Not  %>% as.data.frame())
+```
+
+#### Shrunken log2 foldchanges (LFC)
+```{r}
+# Apply fold change shrinkage
+res_interact_Nod_Sterile_vs_Nod_Not <- lfcShrink(dds_lrt_Interact.vs.Intercept, coef="TissueSurface_NoduleSurface.sterilized_vs_NoduleNot.surface.sterilized")
+res_interact_Nod_Sterile_vs_Nod_Not
+```
+
+#### Summarize results
+```{r}
+summary(res_interact_Nod_Sterile_vs_Nod_Not, alpha = 0.05)
+```
+
+#### Save results
+```{r}
+res_interact_Nod_Sterile_vs_Nod_Not_tb <- res_interact_Nod_Sterile_vs_Nod_Not %>%
+  as.data.frame() %>%
+  rownames_to_column(var="ASV") %>% 
+  as_tibble()
+write.csv(res_interact_Nod_Sterile_vs_Nod_Not_tb, "./16S/test_results_Nod_Sterile_vs_Nod_NotSterile_shrunken_LFC.csv", row.names = F)
+head(res_interact_Nod_Sterile_vs_Nod_Not_tb)
+```
+
+#### Extract significant results
+```{r}
+sig_interact_Nod_Sterile_vs_Nod_Not <- res_interact_Nod_Sterile_vs_Nod_Not_tb %>% filter(padj < 0.05)
+write.csv(sig_interact_Nod_Sterile_vs_Nod_Not, "./16S/significant_results_sig_interact_Nod_Sterile_vs_Nod_Not_shrunken_LFC.csv", row.names = F)
+sig_interact_Nod_Sterile_vs_Nod_Not
+nrow(sig_interact_Nod_Sterile_vs_Nod_Not)
+```
+
+### Volcano plot
+#### log2 fold changes of Nodule, Surface-sterile. vs Nodule, Not surface-sterile. contrasts
+##### Obtain a logical vector where TRUE values denote padj values < 0.05 and fold change > 2 in either direction
+```{r}
+res_interact_Nod_Sterile_vs_Nod_Not_tb <- res_interact_Nod_Sterile_vs_Nod_Not_tb %>% mutate(threshold_TissueSurface = padj < 0.05 & abs(log2FoldChange) >= 1)
+```
+
+##### Make labels for the ASVs meeting the cutoff
+```{r}
+res_interact_Nod_Sterile_vs_Nod_Not_tb$label <- res_interact_Nod_Sterile_vs_Nod_Not_tb$ASV
+res_interact_Nod_Sterile_vs_Nod_Not_tb$label <- gsub("[A-Za-z]+; ", "", res_interact_Nod_Sterile_vs_Nod_Not_tb$label) # Use regex to remove family names from parentheses so it's shorter
+# Apply the function made above to create a new_label column
+res_interact_Nod_Sterile_vs_Nod_Not_tb$new_label <- mapply(modify_label, res_interact_Nod_Sterile_vs_Nod_Not_tb$ASV, res_interact_Nod_Sterile_vs_Nod_Not_tb$label)
+## Remove the label if it does not meet the threshold
+res_interact_Nod_Sterile_vs_Nod_Not_tb <- res_interact_Nod_Sterile_vs_Nod_Not_tb %>% mutate(new_label = case_when(threshold_TissueSurface == TRUE ~ c(new_label, NULL)))
+# Make labels that is just the ASV name if it meets the threshold
+res_interact_Nod_Sterile_vs_Nod_Not_tb$new_label_2 <- gsub(" \\(.*", "", res_interact_Nod_Sterile_vs_Nod_Not_tb$ASV)
+## Remove the label if it does not meet the threshold
+res_interact_Nod_Sterile_vs_Nod_Not_tb <- res_interact_Nod_Sterile_vs_Nod_Not_tb %>% mutate(new_label_2 = case_when(threshold_TissueSurface == TRUE ~ c(new_label_2, NULL)))
+# Make labels just for the three ASVs of interest
+res_interact_Nod_Sterile_vs_Nod_Not_tb <- res_interact_Nod_Sterile_vs_Nod_Not_tb %>% mutate(new_label_3 = case_when(ASV == "ASV5 (Pseudomonadaceae; Pseudomonas)" ~ c("ASV5", NULL), ASV == "ASV28 (Bacillaceae; Bacillus)" ~ c("ASV28", NULL), ASV == "ASV1 (Rhizobiaceae; Sinorhizobium)" ~ c("ASV1", NULL)))
+# Add back label as in new_label_2 if it is an ASV of interest
+res_interact_Nod_Sterile_vs_Nod_Not_tb$new_label_4 <- res_interact_Nod_Sterile_vs_Nod_Not_tb$new_label_2
+res_interact_Nod_Sterile_vs_Nod_Not_tb <- res_interact_Nod_Sterile_vs_Nod_Not_tb %>% mutate(new_label_4 = ifelse(
+    ASV == "ASV5 (Pseudomonadaceae; Pseudomonas)", 
+    list("ASV5", new_label_2),
+    ifelse(
+      ASV == "ASV28 (Bacillaceae; Bacillus)", 
+      list("ASV28", new_label_2),
+      ifelse(
+        ASV == "ASV1 (Rhizobiaceae; Sinorhizobium)",
+        list("ASV1", new_label_2),
+        new_label_2
+      )
+    )
+  ))
+```
+
+##### Volcano plot
+```{r}
+volcano.interact_NodSterile_vs_NodNot <- ggplot(res_interact_Nod_Sterile_vs_Nod_Not_tb, aes(x = log2FoldChange, y = -log10(padj))) +
+                                          geom_point(aes(colour = threshold_TissueSurface)) +
+                                          geom_text_repel(aes(label = new_label_3), max.overlaps = 20, min.segment.length = 0) +
+                                          xlab("log2 fold change") + 
+                                          ylab("-log10 adjusted p-value") +
+                                          theme_linedraw() +
+                                          ggtitle("Nodule, surface-sterilized vs nodule, not surface-sterilized") +
+                                          theme(legend.position = "none", plot.title = element_text(size = 12))
+volcano.interact_NodSterile_vs_NodNot
+```
+
+### Contrasts: surface-sterilized root samples vs not surface-sterilized root samples
+This requires me to re-factor the "Group" variable so I can change the base for the comparisons:
+
+```{r}
+dds_interact$TissueSurface <- relevel(dds_interact$TissueSurface, ref = "RootNot surface-sterilized")
+dds_lrt_Interact.vs.Intercept <- DESeq(dds_interact, test="LRT", reduced = ~ 1) # reduced model is just the intercept
+```
+
+#### Get results
+```{r}
+res_interact_Root_Sterile_vs_Root_Not <- results(dds_lrt_Interact.vs.Intercept, contrast = c("TissueSurface", "RootSurface sterilized", "RootNot surface-sterilized"), alpha = 0.05) # Baseline is not surface-sterilized Root samples
+head(res_interact_Root_Sterile_vs_Root_Not  %>% as.data.frame())
+```
+
+#### Shrunken log2 foldchanges (LFC)
+```{r}
+# Save the unshrunken results to compare
+res_interact_Root_Sterile_vs_Root_Not_unshrunken <- res_interact_Root_Sterile_vs_Root_Not
+
+# Apply fold change shrinkage
+res_interact_Root_Sterile_vs_Root_Not <- lfcShrink(dds_lrt_Interact.vs.Intercept, coef="TissueSurface_RootSurface.sterilized_vs_RootNot.surface.sterilized")
+res_interact_Root_Sterile_vs_Root_Not
+```
+
+#### Summarize results
+```{r}
+summary(res_interact_Root_Sterile_vs_Root_Not, alpha = 0.05)
+```
+
+#### Save results
+```{r}
+res_interact_Root_Sterile_vs_Root_Not_tb <- res_interact_Root_Sterile_vs_Root_Not %>%
+  as.data.frame() %>%
+  rownames_to_column(var="ASV") %>% 
+  as_tibble()
+write.csv(res_interact_Root_Sterile_vs_Root_Not_tb, "./16S/test_results_Root_Sterile_vs_Root_NotSterile_shrunken_LFC.csv", row.names = F)
+head(res_interact_Root_Sterile_vs_Root_Not_tb)
+```
+
+#### Extract significant results
+```{r}
+sig_interact_Root_Sterile_vs_Root_Not <- res_interact_Root_Sterile_vs_Root_Not_tb %>% filter(padj < 0.05)
+write.csv(sig_interact_Root_Sterile_vs_Root_Not, "./16S/significant_results_interact_Root_Sterile_vs_Root_Not_shrunken_LFC.csv", row.names = F)
+sig_interact_Root_Sterile_vs_Root_Not
+nrow(sig_interact_Root_Sterile_vs_Root_Not)
+```
+
+### Volcano plot
+#### log2 fold changes of Root, Surface-sterile. vs Root, Not surface-sterile. contrasts
+##### Obtain a logical vector where TRUE values denote padj values < 0.05 and fold change > 2 in either direction
+```{r}
+res_interact_Root_Sterile_vs_Root_Not_tb <- res_interact_Root_Sterile_vs_Root_Not_tb %>% mutate(threshold_TissueSurface = padj < 0.05 & abs(log2FoldChange) >= 1)
+```
+
+##### Make labels for the ASVs meeting the cutoff
+```{r}
+res_interact_Root_Sterile_vs_Root_Not_tb$label <- res_interact_Root_Sterile_vs_Root_Not_tb$ASV
+res_interact_Root_Sterile_vs_Root_Not_tb$label <- gsub("[A-Za-z]+; ", "", res_interact_Root_Sterile_vs_Root_Not_tb$label) # Use regex to remove family names from parentheses so it's shorter
+# Apply the function made above to create a new_label column
+res_interact_Root_Sterile_vs_Root_Not_tb$new_label <- mapply(modify_label, res_interact_Root_Sterile_vs_Root_Not_tb$ASV, res_interact_Root_Sterile_vs_Root_Not_tb$label)
+## Remove the label if it does not meet the threshold
+res_interact_Root_Sterile_vs_Root_Not_tb <- res_interact_Root_Sterile_vs_Root_Not_tb %>% mutate(new_label = case_when(threshold_TissueSurface == TRUE ~ c(new_label, NULL)))
+# Make labels that is just the ASV name if it meets the threshold
+res_interact_Root_Sterile_vs_Root_Not_tb$new_label_2 <- gsub(" \\(.*", "", res_interact_Root_Sterile_vs_Root_Not_tb$ASV)
+## Remove the label if it does not meet the threshold
+res_interact_Root_Sterile_vs_Root_Not_tb <- res_interact_Root_Sterile_vs_Root_Not_tb %>% mutate(new_label_2 = case_when(threshold_TissueSurface == TRUE ~ c(new_label_2, NULL)))
+# Make labels just for the three ASVs of interest
+res_interact_Root_Sterile_vs_Root_Not_tb <- res_interact_Root_Sterile_vs_Root_Not_tb %>% mutate(new_label_3 = case_when(ASV == "ASV5 (Pseudomonadaceae; Pseudomonas)" ~ c("ASV5", NULL), ASV == "ASV28 (Bacillaceae; Bacillus)" ~ c("ASV28", NULL), ASV == "ASV1 (Rhizobiaceae; Sinorhizobium)" ~ c("ASV1", NULL)))
+# Add back label as in new_label_2 if it is an ASV of interest
+res_interact_Root_Sterile_vs_Root_Not_tb$new_label_4 <- res_interact_Root_Sterile_vs_Root_Not_tb$new_label_2
+res_interact_Root_Sterile_vs_Root_Not_tb <- res_interact_Root_Sterile_vs_Root_Not_tb %>% mutate(new_label_4 = ifelse(
+    ASV == "ASV5 (Pseudomonadaceae; Pseudomonas)", 
+    list("ASV5", new_label_2),
+    ifelse(
+      ASV == "ASV28 (Bacillaceae; Bacillus)", 
+      list("ASV28", new_label_2),
+      ifelse(
+        ASV == "ASV1 (Rhizobiaceae; Sinorhizobium)",
+        list("ASV1", new_label_2),
+        new_label_2
+      )
+    )
+  ))
+```
+
+##### Volcano plot
+```{r}
+volcano.interact_RootSterile_vs_RootNot <- ggplot(res_interact_Root_Sterile_vs_Root_Not_tb, aes(x = log2FoldChange, y = -log10(padj))) +
+                                          geom_point(aes(colour = threshold_TissueSurface)) +
+                                          geom_text_repel(aes(label = new_label_3), max.overlaps = 20, min.segment.length = 0) +
+                                          xlab("log2 fold change") + 
+                                          ylab("-log10 adjusted p-value") +
+                                          theme_linedraw() +
+                                          ggtitle("Root, surface-sterilized vs root, not surface-sterilized") +
+                                          theme(legend.position = "none", plot.title = element_text(size = 12))
+volcano.interact_RootSterile_vs_RootNot
+```
+
+## Patch together plots
+```{r}
+FigS1 <- cowplot::plot_grid(volcano.inoc_717A_vs_141, volcano.inoc_733B_vs_141, volcano.inoc_Nod_vs_Root, volcano.inoc_Sterile_vs_Not, volcano.interact_NodSterile_vs_NodNot, volcano.interact_RootSterile_vs_RootNot, ncol = 2, labels = "AUTO", align = "v", axis = "l", label_size = 24, label_fontfamily = "sans")
+FigS1
+```
+
+### save
+```{r}
+ggsave("./16S/FigS1.png", plot=FigS1, device = "png", width = 6.5, height = 6.5, units = "in", dpi = 300, scale = 2)
+```
+
+# Plot heatmap using normalized count data
+## Get normalized counts, top 50 ASVs only
+```{r}
+vsd_mat_fullmodel <- assay(vst(dds, blind=TRUE, nsub=sum(rowMeans(counts(dds))>5)))
+vsd_mat_fullmodel <- vsd_mat_fullmodel[1:50,]
+```
+
+## Set annotation column colors
+```{r}
+mat_col <- data.frame(metadata[,1:3])
+mat_col[colnames(vsd_mat_fullmodel), ] # reorder so it is the same as the vsd matrix
+mat_colors <- list(Inoculum = brewer.pal(7, "Dark2")[1:3], Tissue = brewer.pal(7, "Dark2")[4:5], Surface = brewer.pal(7, "Dark2")[6:7])
+names(mat_colors$Inoculum) <- unique(mat_col$Inoculum)
+names(mat_colors$Tissue) <- unique(mat_col$Tissue)
+names(mat_colors$Surface) <- unique(mat_col$Surface)
+```
+
+```{r}
+Fig4 <- ComplexHeatmap::pheatmap(
+  mat                  = vsd_mat_fullmodel,
+  cluster_cols         = TRUE,
+  cluster_rows         = TRUE,
+  color                = magma(8),
+  border_color         = NA,
+  show_colnames        = FALSE,
+  show_rownames        = TRUE,
+  annotation_col       = mat_col,
+  annotation_colors    = mat_colors,
+  drop_levels          = TRUE,
+  fontsize             = 9,
+  heatmap_legend_param = list(title = "Abundance\n(variance-stabilized)"),
+)
+Fig4
+```
+
+### save
+```{r}
+# Open a PNG graphics device
+png(filename = "./16S/Fig4.png", width = 9, height = 6.5, units = "in", res = 300)
+# Draw the heatmap
+plot(Fig4)
+# Close the device
+dev.off()
+```
+
