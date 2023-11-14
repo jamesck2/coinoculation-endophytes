@@ -1,0 +1,586 @@
+---
+title: "Co-inoculation"
+author: "JC Kosmopoulos & RT Batstone-Doyle"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+## Setup
+
+```{r Load packages, message=FALSE, warning=FALSE}
+# global options
+knitr::opts_chunk$set(echo = TRUE)
+
+# set working directory
+setwd("../coinoculation-endophytes")
+
+# load packages
+library("tidyverse") # includes ggplot2, dplyr, readr, stringr
+library("knitr") # produce the knitted doc
+library("emmeans") # for posthoc data analysis
+library("lme4") # linear mixed models
+library("lmerTest") ## model selection
+library("car") # ANOVA function for linear mixed models
+library("gridExtra") # for arranging plots
+```
+
+## Greenhouse experiment (Summer 2021)
+
+### Compare uninoculated controls to inoculated plants
+
+```{r controls}
+## load data
+tp_full <- read.csv("greenhouse_coinoc.csv")
+
+## removed three contaminated plants
+tp_all <- tp_full %>%
+  filter(!sample %in% c("InCtrl-2-r15", "733-17-r27", "717-6-r33")) %>%
+  droplevels(.)
+  
+## create additional vars: 
+tp_all$ratio <-tp_all$shoot_mass / tp_all$root_mass
+tp_all$nod_mass.t <-tp_all$nod_mass * 1000
+
+# add in type col (to compare internal, external, and treated)
+tp_all$type <- ifelse(tp_all$treatment == "InCtrl",
+                      "internal",
+                    ifelse(tp_all$treatment == "ExCtrl",
+                           "external","treated"))
+tp_all$type <- factor(tp_all$type, 
+                      levels = c("internal", 
+                                 "external", 
+                                 "treated"))
+
+# rearrange treatment levels to make figures look better
+tp_all$treatment <- factor(tp_all$treatment, 
+                           levels = c("InCtrl","ExCtrl", 
+                                      "522", "702", "717","733", 
+                                      "141", 
+                                      "522co141", 
+                                      "702co141", 
+                                      "717co141", 
+                                      "733co141"))
+
+## traits to analyze:
+traits <- c("height1", "leaf1", "chloro1",
+            "height2","leaf2","chloro2",
+            "height3", "leaf3", "chloro3",
+            "height4","leaf4","chloro4",
+            "nod_mass.t","total_nod",
+            "shoot_mass", "root_mass",
+            "ratio")
+
+## pivot longer for traits
+tp_all.l <- tp_all %>%
+  pivot_longer(cols = all_of(traits), 
+               names_to = "trait", 
+               values_to = "value") %>%
+  separate(trait, 
+           into = c("trait", "wk"), 
+           sep = "(?<=[A-Za-z])(?=[0-9])"
+           )
+
+## add in wk for rest of traits
+tp_all.l$wk <- ifelse(is.na(tp_all.l$wk) == TRUE, 4,
+                      paste0(tp_all.l$wk))
+
+## rename traits for graphs
+trait.labs <- c(chloro = "Leaf chlorophyll A content", 
+            height = "Height (cm)", 
+            leaf = "Leaves (no.)",
+            shoot_mass = "Shoot biomass (mg)",
+            root_mass = "Root biomass (mg)",
+            total_nod = "Total nodules (no.)",
+            nod_mass.t = "Nodule mass (mg)",
+            ratio = "Shoot/root ratio")
+
+### plot
+(p <- ggplot(data = tp_all.l %>% filter(wk == 4), 
+       aes(x = type, y = value, colour = type)) +
+  geom_boxplot() +
+  facet_wrap(~trait, scales = "free", ncol = 2,
+             labeller=labeller(trait = trait.labs)) +
+  labs(x = "Treatment", 
+       y = NULL) +
+  theme_bw() +
+  theme(strip.text = element_text(size = 18, 
+                                  face = "bold"),
+        legend.title = element_text(size = 20),
+        legend.text = element_text(size = 18),
+        axis.title = element_text(size = 20),
+        axis.text = element_text(size = 18),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+  )
+### save
+save_plot("./controls/m1.png", p,
+          ncol = 2, 
+          nrow = 4,
+          base_aspect_ratio = 1.3)
+
+## traits to analyze (exclude nod_mass.t):
+traits2 <- c("height1", "leaf1", "chloro1",
+            "height2","leaf2","chloro2",
+            "height3", "leaf3", "chloro3",
+            "height4","leaf4","chloro4",
+            "total_nod",
+            "shoot_mass", "root_mass",
+            "ratio")
+
+## ANOVAs to compare inoculation treats for each trait
+m1_out <- sapply(traits2, 
+                  df = tp_all, 
+                 ## no nod mass for some treats
+                  simplify = FALSE, USE.NAMES = TRUE,
+                  function(vars, df){
+  ### print var
+  print(vars)
+  ### model
+  lm <- lm(get(vars) ~ type, data = df)
+  ### anova and ranova
+  aov <- Anova(lm) 
+  aov$trait <- paste0(vars)
+  aov$term <- rownames(aov)
+  ### contrasts: type
+  lm.emm <- emmeans(lm, pairwise ~ type)
+  cont <- as.data.frame(lm.emm$contrasts)
+  cont$trait <- paste0(vars)
+  ### return dfs
+  return(list(
+              aov, ## [[1]]
+              cont ## [[2]]
+              )) 
+  }
+)
+
+## combine dfs
+### ANOVAs
+aov <- lapply(m1_out, `[[`, 1) %>%
+  bind_rows(.)
+write.csv(aov, "./controls/m1_aov.csv", 
+          row.names = FALSE)
+### CONTRASTS (emmeans)
+cont <- lapply(m1_out, `[[`, 2) %>%
+  bind_rows(.)
+write.csv(cont, "./controls/m1_cont.csv", 
+          row.names = FALSE)
+
+### traits over time (chloro, leaf, height)
+
+## summarize mean and SE
+tp_all.l_sum <- tp_all.l %>%
+  group_by(type, trait, wk) %>%
+  summarize(mean = mean(value, na.rm = TRUE),
+            se = sd(value, na.rm = TRUE)/sqrt(n())
+            )
+
+## look at traits over time
+### plot
+(p <- ggplot(data = tp_all.l_sum %>% 
+               filter(trait %in% c("chloro", 
+                                   "height", 
+                                   "leaf")), 
+       aes(x = factor(wk), y = mean, colour = type)) +
+  geom_pointrange(aes(ymin = mean - se, 
+                      ymax = mean + se)) +
+  geom_line(aes(group = type), linetype = 2) +
+  facet_wrap(~trait, scales = "free", ncol = 1,
+             labeller=labeller(trait = trait.labs)) +
+  labs(x = "Weeks post planting (no.)", 
+       y = "Mean + SE") +
+  theme_bw() +
+  theme(strip.text = element_text(size = 18, 
+                                  face = "bold"),
+        legend.title = element_text(size = 20),
+        legend.text = element_text(size = 18),
+        axis.title = element_text(size = 20),
+        axis.text = element_text(size = 18),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+)
+
+save_plot("./controls/m2.png", p,
+          ncol = 2, 
+          nrow = 3,
+          base_aspect_ratio = 1.3)
+
+## ANOVAs to compare types for each trait and time-point
+traits.wk <- c("chloro", "height", "leaf")
+m2_out <- sapply(traits.wk, 
+                  df = tp_all.l,
+                  simplify = FALSE, USE.NAMES = TRUE,
+                  function(vars, df){
+  ### print var
+  print(vars)
+  ### specify trait
+  df.s <- df %>%
+    filter(trait == vars)
+  ### model
+  lm <- lm(value ~ type*factor(wk), data = df.s)
+  ### anova and ranova
+  aov <- Anova(lm, type = 3) 
+  aov$trait <- paste0(vars)
+  aov$term <- rownames(aov)
+  ### contrasts: type
+  lm.emm <- emmeans(lm, pairwise ~ type | wk)
+  cont <- as.data.frame(lm.emm$contrasts)
+  cont$trait <- paste0(vars)
+  ### return dfs
+  return(list(
+              aov, ## [[1]]
+              cont ## [[2]]
+              )) 
+  }
+)
+
+## combine dfs
+### ANOVAs
+aov <- lapply(m2_out, `[[`, 1) %>%
+  bind_rows(.)
+write.csv(aov, "./controls/m2_aov.csv", 
+          row.names = FALSE)
+### CONTRASTS (emmeans)
+cont <- lapply(m2_out, `[[`, 2) %>%
+  bind_rows(.)
+write.csv(cont, "./controls/m2_cont.csv", 
+          row.names = FALSE)
+
+## save df for all endpoint measures
+tp_ep <- tp_all %>%
+  select(-height1, -leaf1, -chloro1,
+         -height2, -leaf2, -chloro2,
+         -height3, -leaf3, -chloro3,
+         -nod_mass)
+save(tp_ep, file = "./tp_ep.Rdata")
+```
+
+## Compare among inoculation treatments
+
+```{r inoculated}
+## load df
+load(file = "./tp_ep.Rdata") ## loads tp_ep
+
+### rename treats
+tp_ep$treat <- ifelse(grepl("co", tp_ep$treatment, fixed = FALSE),"Co-inoculation",
+                      ifelse(tp_ep$treatment == "141", "Rhizobia-only",
+                             ifelse(grepl("Ctrl", tp_ep$treatment, fixed = FALSE),
+                                    "Control", "NRE-only")))
+tp_ep$treat <- factor(tp_ep$treat, 
+                      levels = c("Control","NRE-only",
+                                 "Co-inoculation","Rhizobia-only"))
+
+## plot to compare traits across treatments
+
+traits <- c("height4", "leaf4" ,"chloro4","ratio",
+            "shoot_mass","root_mass",
+            "total_nod", "nod_mass.t")
+
+## pivot longer for traits
+tp_ep.l <- tp_ep %>%
+  pivot_longer(cols = all_of(traits), 
+               names_to = "trait", 
+               values_to = "value")
+
+## order for figure
+tp_ep.l$trait <- factor(tp_ep.l$trait,
+                        levels = traits)
+
+## get raw means
+## summarize mean and SE
+tp_ep.l_sum <- tp_ep.l %>%
+  group_by(treat, treatment, trait) %>%
+  summarize(mean = mean(value, na.rm = TRUE),
+            se = sd(value, na.rm = TRUE)/sqrt(n())
+            )
+
+## rename traits for graphs
+trait.labs <- c(chloro4 = "Leaf chlorophyll A content", 
+            height4 = "Height (cm)", 
+            leaf4 = "Leaves (no.)",
+            ratio = "Shoot/root ratio",
+            shoot_mass = "Shoot biomass (mg)",
+            root_mass = "Root biomass (mg)",
+            total_nod = "Total nodules (no.)",
+            nod_mass.t = "Nodule mass (mg)"
+            )
+
+### plot
+(p <- ggplot(data = tp_ep.l_sum %>% filter(treatment != "ExCtrl"), 
+       aes(x = treat, y = mean, color = treatment)) +
+  geom_hline(data = tp_ep.l_sum %>% filter(treatment == "ExCtrl"),
+             aes(yintercept = mean), linetype = 2) +
+  geom_pointrange(aes(ymin = mean - se, ymax = mean + se),
+                  position = "jitter", width = 0.1) +
+  facet_wrap(~trait, scales = "free", ncol = 4,
+             labeller=labeller(trait = trait.labs)) +
+  labs(x = "Treatment", 
+       y = "Mean +/- SE") +
+  theme_bw() +
+  theme(strip.text = element_text(size = 18, 
+                                  face = "bold"),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 18),
+        axis.title = element_text(size = 20),
+        axis.text.y = element_text(size = 16),
+        axis.text.x = element_text(size = 16,
+                                   angle = 30,
+                                   hjus = 0.5, vjust = 0.5),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+  )
+### save
+save_plot("./treated/m3.png", p,
+          ncol = 4, 
+          nrow = 2,
+          base_aspect_ratio = 1.3)
+
+## removed nod_mass.t
+traits2 <- c("height4", "leaf4" ,"chloro4","ratio",
+            "shoot_mass","root_mass",
+            "total_nod")
+
+## ANOVAs to compare inoculation treats for each trait
+m3_out <- sapply(traits2, 
+                  df = tp_ep,
+                  simplify = FALSE, USE.NAMES = TRUE,
+                  function(vars, df){
+  ### print var
+  print(vars)
+  ### model
+  lmm <- lmer(get(vars) ~ treatment + (1|rack), data = df)
+  ### res vs fit plot
+  resVsFits.p <- plot(lmm, main = paste0(vars))
+  ### anova and ranova
+  aov <- anova(lmm) 
+  aov$trait <- paste0(vars)
+  aov$term <- rownames(aov)
+  ran <- ranova(lmm)
+  ran$trait <- paste0(vars)
+  ran$term <- rownames(ran)
+  ### contrasts: type
+  lm.emm <- emmeans(lmm, pairwise ~ treatment, adjust = "fdr")
+  cont <- as.data.frame(lm.emm$contrasts)
+  cont$trait <- paste0(vars)
+  ### return dfs
+  return(list(resVsFits.p, ## [[1]]
+              aov, ## [[2]]
+              ran, ## [[3]]
+              cont ## [[4]]
+              )) 
+  }
+)
+
+## combine res_vs_fits plot
+fig <- plot_grid(plotlist = lapply(m3_out, `[[`, 1),
+          ncol = 4,
+          nrow = 2,
+          align = "hv",
+          labels = NULL)
+
+save_plot("./treated/m3_resvsfits.png", fig,
+          ncol = 4, 
+          nrow = 2,
+          base_aspect_ratio = 1.3)
+
+## combine dfs
+### ANOVAs
+aov <- lapply(m3_out, `[[`, 2) %>%
+  bind_rows(.)
+write.csv(aov, "./treated/m3_aov.csv", row.names = FALSE)
+### RANOVAS
+ran <- lapply(m3_out, `[[`, 3) %>%
+  bind_rows(.)
+write.csv(ran, "./treated/m3_ran.csv", row.names = FALSE)
+### CONTRASTS (emmeans)
+cont <- lapply(m3_out, `[[`, 4) %>%
+  bind_rows(.)
+write.csv(cont, "./treated/m3_cont.csv", row.names = FALSE)
+
+## Figs for paper (shoot and nod only)
+(p1 <- ggplot(tp_ep %>% 
+         filter(treatment %in% c("141","522co141",
+                                 "702co141","717co141","733co141")), 
+       aes(x = treatment, y = shoot_mass)) +
+  geom_hline(data = tp_ep %>% 
+         filter(treatment %in% c("ExCtrl")),
+                aes(yintercept = mean(shoot_mass, na.rm = TRUE)),
+                linetype = 2) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2) +
+  scale_x_discrete(breaks = c("141","522co141",
+                                 "702co141","717co141","733co141"),
+                   labels = c(expression(atop(italic("Sinorhizobium "), only)),
+                              expression(atop(Co-inoculation, with~italic("Pa. ")~522)),
+                              expression(atop(Co-inoculation, with~italic("Ps. ")~"702A")),
+                              expression(atop(Co-inoculation, with~italic("Pa. ")~"717A")),
+                              expression(atop(Co-inoculation, with~italic("Ps. ")~"733A"))
+                              )
+                   ) +
+  labs(x = "Inoculation treatment", y = "Shoot biomass (mg)") +
+  ## annotations
+  ### 1 vs 2
+  annotate("segment", x = 1, xend = 2, y = 560, yend = 560, size = 2) + ## horizontal
+  annotate("segment", x = 1, xend = 1, y = 567, yend = 545, size = 2) + ## vertical cap
+  annotate("segment", x = 2, xend = 2, y = 567, yend = 545, size = 2) + ## vertical cap
+  annotate("text", x = 1.5, y = 590, label = "NS", size = 5) + ## text
+  ### 1 vs 3
+  annotate("segment", x = 1, xend = 3, y = 620, yend = 620, size = 2) + ## horizontal
+  annotate("segment", x = 1, xend = 1, y = 627, yend = 605, size = 2) + ## vertical cap
+  annotate("segment", x = 3, xend = 3, y = 627, yend = 605, size = 2) + ## vertical cap
+  annotate("text", x = 2, y = 650, label = "NS", size = 5) + ## text
+  ### 1 vs 4
+  annotate("segment", x = 1, xend = 4, y = 680, yend = 680, size = 2) + ## horizontal
+  annotate("segment", x = 1, xend = 1, y = 687, yend = 665, size = 2) + ## vertical cap
+  annotate("segment", x = 4, xend = 4, y = 687, yend = 665, size = 2) + ## vertical cap
+  annotate("text", x = 2.5, y = 710, label = "p = 0.0057", size = 5) + ## text
+  ### 1 vs 5
+  annotate("segment", x = 1, xend = 5, y = 740, yend = 740, size = 2) + ## horizontal
+  annotate("segment", x = 1, xend = 1, y = 747, yend = 725, size = 2) + ## vertical cap
+  annotate("segment", x = 5, xend = 5, y = 747, yend = 725, size = 2) + ## vertical cap
+  annotate("text", x = 3, y = 770, label = "p = 0.0125", size = 5) + ## text
+  ## themes
+  theme_bw() +
+  theme(axis.title.y = element_text(size = 16),
+        axis.text.y = element_text(size = 14),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+)
+
+(p2 <- ggplot(tp_ep %>% 
+         filter(treatment %in% c("141","522co141",
+                                 "702co141","717co141","733co141")), 
+       aes(x = treatment, y = total_nod)) +
+  geom_hline(data = tp_ep %>% 
+         filter(treatment %in% c("ExCtrl")),
+                aes(yintercept = mean(total_nod, na.rm = TRUE)),
+                linetype = 2) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2) +
+  scale_x_discrete(breaks = c("141","522co141",
+                                 "702co141","717co141","733co141"),
+                   labels = c(expression(atop(italic("Sinorhizobium "), only)),
+                              expression(atop(Co-inoculation, with~italic("Pa. ")~522)),
+                              expression(atop(Co-inoculation, with~italic("Ps. ")~"702A")),
+                              expression(atop(Co-inoculation, with~italic("Pa. ")~"717A")),
+                              expression(atop(Co-inoculation, with~italic("Ps. ")~"733A"))
+                              )
+                   ) +
+  labs(x = "Inoculation treatment", y = "Nodule number (no.)") +
+  ## annotations
+  ### 1 vs 2
+  annotate("segment", x = 1, xend = 2, y = 65, yend = 65, size = 2) + ## horizontal
+  annotate("segment", x = 1, xend = 1, y = 66, yend = 60, size = 2) + ## vertical cap
+  annotate("segment", x = 2, xend = 2, y = 66, yend = 60, size = 2) + ## vertical cap
+  annotate("text", x = 1.5, y = 70, label = "NS", size = 5) + ## text
+  ### 1 vs 3
+  annotate("segment", x = 1, xend = 3, y = 75, yend = 75, size = 2) + ## horizontal
+  annotate("segment", x = 1, xend = 1, y = 76, yend = 70, size = 2) + ## vertical cap
+  annotate("segment", x = 3, xend = 3, y = 76, yend = 70, size = 2) + ## vertical cap
+  annotate("text", x = 2, y = 80, label = "NS", size = 5) + ## text
+  ### 1 vs 4
+  annotate("segment", x = 1, xend = 4, y = 85, yend = 85, size = 2) + ## horizontal
+  annotate("segment", x = 1, xend = 1, y = 86, yend = 80, size = 2) + ## vertical cap
+  annotate("segment", x = 4, xend = 4, y = 86, yend = 80, size = 2) + ## vertical cap
+  annotate("text", x = 2.5, y = 90, label = "p = 0.0359", size = 5) + ## text
+  ### 1 vs 5
+  annotate("segment", x = 1, xend = 5, y = 95, yend = 95, size = 2) + ## horizontal
+  annotate("segment", x = 1, xend = 1, y = 96, yend = 90, size = 2) + ## vertical cap
+  annotate("segment", x = 5, xend = 5, y = 96, yend = 90, size = 2) + ## vertical cap
+  annotate("text", x = 3, y = 100, label = "p = 0.0181", size = 5) + ## text
+  ## themes
+  theme_bw() +
+  theme(axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+)
+
+## combine res_vs_fits plot
+fig <- plot_grid(p1, p2,
+          ncol = 1,
+          nrow = 2,
+          rel_heights = c(0.8,1),
+          align = "v",
+          labels = c("A","B"))
+
+## save plot
+save_plot("./treated/Fig1.png", fig,
+          ncol = 1, 
+          nrow = 2,
+          base_aspect_ratio = 2.5)
+```
+
+## N addition experiment (Spring 2022)
+
+```{r N_addition}
+Nadd <- read.csv("greenhouse_N_add.csv") # Load data
+Nadd$Rack <- as.factor(Nadd$Rack) # Convert rack column to a categorical variable
+Nadd$PlantNo <- as.factor(Nadd$PlantNo) # Convert PlantNo column to a categorical variable
+
+## remove single contaminated plant
+Nadd.r <- Nadd %>%
+  filter(PlantNo != 1) %>%
+  droplevels(.)
+
+## fig all data
+ggplot(Nadd.r, aes(x = N.add, y = ShootMass, color = Inoc)) +
+  geom_boxplot()
+
+## Fig for paper
+(p <- ggplot(Nadd.r %>% 
+               filter(N.add == TRUE & Inoc != "Sterile"), 
+            aes(x = Inoc, y = ShootMass)) +
+  geom_hline(data = Nadd.r %>%
+         filter(N.add == TRUE & Inoc == "Sterile"),
+                aes(yintercept = mean(ShootMass, na.rm = TRUE)),
+                linetype = 2) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2) +
+  scale_x_discrete(breaks = c("717A","733B"),
+                   labels = c(expression(italic("Ps. ")~"717A"),
+                              expression(italic("Ps. ")~"733B"))
+                              ) +
+  labs(x = "Inoculation treatment", y = "Shoot biomass (g)") +
+  annotate("text", x = 1, y = 80, label = "NS", size = 5) + ## text
+  annotate("text", x = 2, y = 80, label = "NS", size = 5) + ## text
+  ## themes
+  theme_bw() +
+  theme(axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+)
+### save
+  save_plot("./Nadd/Fig2.png", p,
+          ncol = 1, 
+          nrow = 1,
+          base_aspect_ratio = 1.3)
+
+## model
+## ANOVAs to compare inoculation treats for each trait
+m4 <- lmer(ShootMass ~ Inoc + (1|Rack), data = Nadd.r %>%
+             filter(N.add == TRUE))
+  ### res vs fit plot
+  resVsFits.p <- plot(m4)
+  ### save
+  png("./Nadd/resvfits_m4.png")
+  print(resVsFits.p)
+  dev.off()
+  ### anova and ranova
+  aov <- anova(m4) 
+  ran <- ranova(m4)
+  ### contrasts: type
+  lm.emm <- emmeans(m4, pairwise ~ Inoc, adjust = "fdr")
+  cont <- as.data.frame(lm.emm$contrasts)
+## save outputs
+### ANOVAs
+write.csv(aov, "./Nadd/m4_aov.csv", row.names = FALSE)
+### RANOVAS
+write.csv(ran, "./Nadd/m4_ran.csv", row.names = FALSE)
+### CONTRASTS (emmeans)
+write.csv(cont, "./Nadd/m4_cont.csv", row.names = FALSE)
+```
