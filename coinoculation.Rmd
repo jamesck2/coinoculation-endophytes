@@ -412,11 +412,11 @@ write.csv(cont, "./treated/m3_cont.csv", row.names = FALSE)
   geom_jitter(width = 0.2) +
   scale_x_discrete(breaks = c("141","522co141",
                                  "702co141","717co141","733co141"),
-                   labels = c(expression(atop(italic("Sinorhizobium "), only)),
-                              expression(atop(Co-inoculation, with~italic("Pa. ")~522)),
-                              expression(atop(Co-inoculation, with~italic("Ps. ")~"702A")),
-                              expression(atop(Co-inoculation, with~italic("Pa. ")~"717A")),
-                              expression(atop(Co-inoculation, with~italic("Ps. ")~"733A"))
+                   labels = c(expression(italic("Sino. ")~only),
+                              expression(Co- ~italic("Pa. ")~522),
+                              expression(Co- ~italic("Ps. ")~"702A"),
+                              expression(Co- ~italic("Pa. ")~"717A"),
+                              expression(Co- ~italic("Ps. ")~"733A")
                               )
                    ) +
   labs(x = "Inoculation treatment", y = "Shoot biomass (mg)") +
@@ -463,11 +463,11 @@ write.csv(cont, "./treated/m3_cont.csv", row.names = FALSE)
   geom_jitter(width = 0.2) +
   scale_x_discrete(breaks = c("141","522co141",
                                  "702co141","717co141","733co141"),
-                   labels = c(expression(atop(italic("Sinorhizobium "), only)),
-                              expression(atop(Co-inoculation, with~italic("Pa. ")~522)),
-                              expression(atop(Co-inoculation, with~italic("Ps. ")~"702A")),
-                              expression(atop(Co-inoculation, with~italic("Pa. ")~"717A")),
-                              expression(atop(Co-inoculation, with~italic("Ps. ")~"733A"))
+                   labels = c(expression(italic("Sino. ")~only),
+                              expression(Co- ~italic("Pa. ")~522),
+                              expression(Co- ~italic("Ps. ")~"702A"),
+                              expression(Co- ~italic("Pa. ")~"717A"),
+                              expression(Co- ~italic("Ps. ")~"733A")
                               )
                    ) +
   labs(x = "Inoculation treatment", y = "Nodule number (no.)") +
