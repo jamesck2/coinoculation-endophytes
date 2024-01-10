@@ -546,8 +546,10 @@ ggplot(Nadd.r, aes(x = N.add, y = ShootMass, color = Inoc)) +
                               expression(italic("Ps. ")~"733B"))
                               ) +
   labs(x = "Inoculation treatment", y = "Shoot biomass (g)") +
-  annotate("text", x = 1, y = 80, label = "NS", size = 5) + ## text
-  annotate("text", x = 2, y = 80, label = "NS", size = 5) + ## text
+  annotate("text", x = 1.5, y = 85, label = "NS", size = 5) + ## text
+  annotate("segment", x = 1, xend = 2, y = 80, yend = 80, size = 2) + ## horizontal
+  annotate("segment", x = 1, xend = 1, y = 78, yend = 80.75, size = 2) + ## vertical cap
+  annotate("segment", x = 2, xend = 2, y = 78, yend = 80.75, size = 2) + ## vertical cap
   ## themes
   theme_bw() +
   theme(axis.title = element_text(size = 16),
