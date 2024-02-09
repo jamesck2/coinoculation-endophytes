@@ -1,5 +1,5 @@
 ---
-title: "16S V3-V4 amplicon sequencing (Fluidigm) of root nodule endosphere from <i>M. truncatula</i> DZA co-inoculated with <i>S. meliloti</i> MAG141 and either <i>Paenibacillus</i> sp. MAG717A or <i>Pseudomonas</i> sp. MAG733B." 
+title: "16S V3-V4 amplicon sequencing (Fluidigm) of root nodule endosphere from <i>M. truncatula</i> DZA co-inoculated with <i>S. meliloti</i> MAG141 and either <i>Bacillus</i> sp. MAG717A or <i>Pseudomonas</i> sp. MAG733B." 
 author: "JC Kosmopoulos"
 date: "`r Sys.Date()`"
 output: html_document
