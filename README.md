@@ -6,7 +6,7 @@ This repository contains all the data and code used for Kosmopoulos, Batstone-Do
 - `coinoculation.Rmd` contains all the code to reproduce **Figures 2 & 3**
 - `tp_ep.Rdata` contains the saved endpoint measurements after reformatting the data in `greenhouse_coinoc.csv`
 - `dada2_deseq2.Rmd` contains all the code to reproduce **Figures 4 & S1**
-    - **NOTE:** To fully execute the code to produce these figures and reproduce **Figures 4 & S1**, you must obtain the raw 16S V3-V4 amplicon reads used in this analysis. These files can be found online from the National Center for Biotechnology Information under BioProject [PRJNAXXXXXXX](www.ncbi.nlm.nih.gov/bioproject/XXXXXXX). **Alternatively**, if you choose to forego reproducing the initial steps in this workflow (from filtering & trimming raw sequence reads through sequence dereplication) you can load `dadaFs.RDS` and `dadaRs.RDS` to obtain previously generated dada2 objects for these data.
+    - **NOTE:** To fully execute the code to produce these figures and reproduce **Figures 4 & S1**, you must obtain the raw 16S V3-V4 amplicon reads used in this analysis. These files can be found online from the National Center for Biotechnology Information under BioProject [PRJNA1077341](https://www.ncbi.nlm.nih.gov/bioproject/PRJNA1077341). **Alternatively**, if you choose to forego reproducing the initial steps in this workflow (from filtering & trimming raw sequence reads through sequence dereplication) you can load `dadaFs.RDS` and `dadaRs.RDS` to obtain previously generated dada2 objects for these data.
 - `dadaFs.RDS`, `dadaRs.RDS` see note above
 - `16S_metadata.csv` contains all the metadata for the tissue occupancy experiment used to generate **Figures 4 & S1**
 
