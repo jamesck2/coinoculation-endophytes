@@ -28,7 +28,6 @@ library("cowplot")
 ```
 
 ## Greenhouse experiment (Summer 2021)
-
 ### Compare uninoculated controls to inoculated plants
 
 ```{r controls}
@@ -257,262 +256,104 @@ tp_ep <- tp_all %>%
 save(tp_ep, file = "./tp_ep.Rdata")
 ```
 
-## Compare among inoculation treatments
+## Compare among inoculation treatments (updated 2-23-24)
+Presented analysis at data lunch to get feedback. Implemented below:
 
-```{r inoculated}
+```{r inoculated-data-lunch}
 ## load df
 load(file = "./tp_ep.Rdata") ## loads tp_ep
 
-### rename treats
-tp_ep$treat <- ifelse(grepl("co", tp_ep$treatment, fixed = FALSE),"Co-inoculation",
-                      ifelse(tp_ep$treatment == "141", "Rhizobia-only",
-                             ifelse(grepl("Ctrl", tp_ep$treatment, fixed = FALSE),
-                                    "Control", "NRE-only")))
-tp_ep$treat <- factor(tp_ep$treat, 
-                      levels = c("Control","NRE-only",
-                                 "Co-inoculation","Rhizobia-only"))
+## include a rhizobia+ and rhizobia- factor
+tp_ep$rhizo <- ifelse(grepl("141", tp_ep$treatment, fixed = FALSE),
+                      "yes","no")
 
-## plot to compare traits across treatments
+## reorder treatment
+tp_ep$treatment2 <- relevel(tp_ep$treatment, "141")
 
-traits <- c("height4", "leaf4" ,"chloro4","ratio",
-            "shoot_mass","root_mass",
-            "total_nod", "nod_mass.t")
+## new models (shoot)
+lmm <- lmer(shoot_mass ~ rhizo + treatment2 + (1|rack), data = tp_ep)
+summary(lmm)
+plot(lmm)
+anova(lmm, type = 2)
+## EM means
+lm.emm.shoot <- emmeans(lmm, trt.vs.ctrl ~ treatment2 | rhizo)
+lm.emm.shoot.df <- as.data.frame(lm.emm.shoot$emmeans)
+lm.emm.shoot.df$trait <- "shoot"
+## EM contrasts (Dunnet)
+lm.emm.cont.shoot <- lm.emm.shoot$contrasts %>%
+  summary(infer = TRUE) %>%
+  mutate(trait = "shoot")
+## calculate percent diff
+lm.emm.cont.shoot$perc_diff <- ifelse(grepl("141", lm.emm.cont.shoot$contrast, fixed = FALSE),
+                                round(((lm.emm.cont.shoot$estimate/263.4)*100), 0),
+                                round(((lm.emm.cont.shoot$estimate/44.7)*100), 0))
 
-## pivot longer for traits
-tp_ep.l <- tp_ep %>%
-  pivot_longer(cols = all_of(traits), 
-               names_to = "trait", 
-               values_to = "value")
-
-## order for figure
-tp_ep.l$trait <- factor(tp_ep.l$trait,
-                        levels = traits)
-
-## get raw means
-## summarize mean and SE
-tp_ep.l_sum <- tp_ep.l %>%
-  group_by(treat, treatment, trait) %>%
-  summarize(mean = mean(value, na.rm = TRUE),
-            se = sd(value, na.rm = TRUE)/sqrt(n())
-            )
-
-## rename traits for graphs
-trait.labs <- c(chloro4 = "Leaf chlorophyll A content", 
-            height4 = "Height (cm)", 
-            leaf4 = "Leaves (no.)",
-            ratio = "Shoot/root ratio",
-            shoot_mass = "Shoot biomass (mg)",
-            root_mass = "Root biomass (mg)",
-            total_nod = "Total nodules (no.)",
-            nod_mass.t = "Nodule mass (mg)"
-            )
-
-### plot
-(p <- ggplot(data = tp_ep.l_sum %>% filter(treatment != "ExCtrl"), 
-       aes(x = treat, y = mean, color = treatment)) +
-  geom_hline(data = tp_ep.l_sum %>% filter(treatment == "ExCtrl"),
-             aes(yintercept = mean), linetype = 2) +
-  geom_pointrange(aes(ymin = mean - se, ymax = mean + se),
-                  position = "jitter", width = 0.1) +
-  facet_wrap(~trait, scales = "free", ncol = 4,
-             labeller=labeller(trait = trait.labs)) +
-  labs(x = "Treatment", 
-       y = "Mean +/- SE") +
-  theme_bw() +
-  theme(strip.text = element_text(size = 18, 
-                                  face = "bold"),
-        legend.title = element_blank(),
-        legend.text = element_text(size = 18),
-        axis.title = element_text(size = 20),
-        axis.text.y = element_text(size = 16),
-        axis.text.x = element_text(size = 16,
-                                   angle = 30,
-                                   hjus = 0.5, vjust = 0.5),
-        panel.grid.major = element_blank(),
-        panel.grid.minor = element_blank())
-  )
-### save
-save_plot("./treated/m3.png", p,
-          ncol = 4, 
-          nrow = 2,
-          base_aspect_ratio = 1.3)
-
-## removed nod_mass.t
-traits2 <- c("height4", "leaf4" ,"chloro4","ratio",
-            "shoot_mass","root_mass",
-            "total_nod")
-
-## ANOVAs to compare inoculation treats for each trait
-m3_out <- sapply(traits2, 
-                  df = tp_ep,
-                  simplify = FALSE, USE.NAMES = TRUE,
-                  function(vars, df){
-  ### print var
-  print(vars)
-  ### model
-  lmm <- lmer(get(vars) ~ treatment + (1|rack), data = df)
-  ### res vs fit plot
-  resVsFits.p <- plot(lmm, main = paste0(vars))
-  ### anova and ranova
-  aov <- anova(lmm) 
-  aov$trait <- paste0(vars)
-  aov$term <- rownames(aov)
-  ran <- ranova(lmm)
-  ran$trait <- paste0(vars)
-  ran$term <- rownames(ran)
-  ### contrasts: type
-  lm.emm <- emmeans(lmm, pairwise ~ treatment, adjust = "fdr")
-  cont <- as.data.frame(lm.emm$contrasts)
-  cont$trait <- paste0(vars)
-  ### return dfs
-  return(list(resVsFits.p, ## [[1]]
-              aov, ## [[2]]
-              ran, ## [[3]]
-              cont ## [[4]]
-              )) 
-  }
-)
-
-## combine res_vs_fits plot
-fig <- plot_grid(plotlist = lapply(m3_out, `[[`, 1),
-          ncol = 4,
-          nrow = 2,
-          align = "hv",
-          labels = NULL)
-
-save_plot("./treated/m3_resvsfits.png", fig,
-          ncol = 4, 
-          nrow = 2,
-          base_aspect_ratio = 1.3)
+## new models (total_nod)
+lmm <- lmer(total_nod ~ rhizo + treatment2 + (1|rack), data = tp_ep)
+summary(lmm)
+plot(lmm)
+anova(lmm, type = 2)
+## EM means
+lm.emm.nod <- emmeans(lmm, trt.vs.ctrl ~ treatment2 | rhizo) 
+lm.emm.nod.df <- as.data.frame(lm.emm.nod$emmeans)
+lm.emm.nod.df$trait <- "nods"
+## EM contrasts
+lm.emm.cont.nod <- lm.emm.nod$contrasts %>%
+  summary(infer = TRUE) %>%
+  mutate(trait = "nods")
+lm.emm.cont.nod$perc_diff <- ifelse(grepl("141", lm.emm.cont.nod$contrast, fixed = FALSE),
+                                round(((lm.emm.cont.nod$estimate/40.4)*100), 0),
+                                0)
 
 ## combine dfs
-### ANOVAs
-aov <- lapply(m3_out, `[[`, 2) %>%
-  bind_rows(.)
-write.csv(aov, "./treated/m3_aov.csv", row.names = FALSE)
-### RANOVAS
-ran <- lapply(m3_out, `[[`, 3) %>%
-  bind_rows(.)
-write.csv(ran, "./treated/m3_ran.csv", row.names = FALSE)
-### CONTRASTS (emmeans)
-cont <- lapply(m3_out, `[[`, 4) %>%
-  bind_rows(.)
-write.csv(cont, "./treated/m3_cont.csv", row.names = FALSE)
+lm.emm <- rbind(lm.emm.shoot.df, lm.emm.nod.df)
+lm.emm_cont <- rbind(lm.emm.cont.shoot, lm.emm.cont.nod)
 
-## Figs for paper (shoot and nod only)
-(p1 <- ggplot(tp_ep %>% 
-         filter(treatment %in% c("141","522co141",
-                                 "702co141","717co141","733co141")), 
-       aes(x = treatment, y = shoot_mass)) +
-  geom_hline(data = tp_ep %>% 
-         filter(treatment %in% c("ExCtrl")),
-                aes(yintercept = mean(shoot_mass, na.rm = TRUE)),
-                linetype = 2) +
-  geom_boxplot() +
-  geom_jitter(width = 0.2) +
-  scale_x_discrete(breaks = c("141","522co141",
-                                 "702co141","717co141","733co141"),
-                   labels = c(expression(italic("Sino. ")~only),
-                              expression(Co- ~italic("Pa. ")~522),
-                              expression(Co- ~italic("Ps. ")~"702A"),
-                              expression(Co- ~italic("Ba. ")~"717A"),
-                              expression(Co- ~italic("Ps. ")~"733B")
-                              )
-                   ) +
-  labs(x = "Inoculation treatment", y = "Shoot biomass (mg)") +
-  ## annotations
-  ### 1 vs 2
-  annotate("segment", x = 1, xend = 2, y = 560, yend = 560, size = 2) + ## horizontal
-  annotate("segment", x = 1, xend = 1, y = 567, yend = 545, size = 2) + ## vertical cap
-  annotate("segment", x = 2, xend = 2, y = 567, yend = 545, size = 2) + ## vertical cap
-  annotate("text", x = 1.5, y = 590, label = "NS", size = 5) + ## text
-  ### 1 vs 3
-  annotate("segment", x = 1, xend = 3, y = 620, yend = 620, size = 2) + ## horizontal
-  annotate("segment", x = 1, xend = 1, y = 627, yend = 605, size = 2) + ## vertical cap
-  annotate("segment", x = 3, xend = 3, y = 627, yend = 605, size = 2) + ## vertical cap
-  annotate("text", x = 2, y = 650, label = "NS", size = 5) + ## text
-  ### 1 vs 4
-  annotate("segment", x = 1, xend = 4, y = 680, yend = 680, size = 2) + ## horizontal
-  annotate("segment", x = 1, xend = 1, y = 687, yend = 665, size = 2) + ## vertical cap
-  annotate("segment", x = 4, xend = 4, y = 687, yend = 665, size = 2) + ## vertical cap
-  annotate("text", x = 2.5, y = 710, label = "p = 0.0057", size = 5) + ## text
-  ### 1 vs 5
-  annotate("segment", x = 1, xend = 5, y = 740, yend = 740, size = 2) + ## horizontal
-  annotate("segment", x = 1, xend = 1, y = 747, yend = 725, size = 2) + ## vertical cap
-  annotate("segment", x = 5, xend = 5, y = 747, yend = 725, size = 2) + ## vertical cap
-  annotate("text", x = 3, y = 770, label = "p = 0.0125", size = 5) + ## text
-  ## themes
+## save contrasts
+write.csv(lm.emm, file = "./treated/EM_means.csv", row.names = FALSE)
+write.csv(lm.emm_cont, file = "./treated/EM_means_contrasts.csv", row.names = FALSE)
+
+# plotting
+
+## change order of traits
+lm.emm_cont$trait2 <- factor(lm.emm_cont$trait, levels = c("shoot", "nods"))
+
+## New facet label names for trait variable
+trait.labs <- c("Shoot biomass (mg)", "Nodules (no.)")
+names(trait.labs) <- c("shoot", "nods")
+
+## plot of contrasts
+fig <- ggplot(lm.emm_cont %>% filter(rhizo == "yes"), 
+       aes(x = contrast, y = estimate)) +
+  geom_pointrange(aes(ymin = lower.CL, ymax = upper.CL), size = 1) +
+  geom_text(aes(label = paste0(perc_diff,"%")), nudge_x = 0.3) +
+  geom_hline(aes(yintercept = 0), linetype = 2) +
+  facet_wrap(~trait2, scale = "free_y", ncol = 1,
+             labeller = labeller(trait2 = trait.labs)) +
   theme_bw() +
-  theme(axis.title.y = element_text(size = 16),
-        axis.text.y = element_text(size = 14),
-        axis.title.x = element_blank(),
-        axis.text.x = element_blank(),
-        panel.grid.major = element_blank(),
-        panel.grid.minor = element_blank())
-)
-
-(p2 <- ggplot(tp_ep %>% 
-         filter(treatment %in% c("141","522co141",
-                                 "702co141","717co141","733co141")), 
-       aes(x = treatment, y = total_nod)) +
-  geom_hline(data = tp_ep %>% 
-         filter(treatment %in% c("ExCtrl")),
-                aes(yintercept = mean(total_nod, na.rm = TRUE)),
-                linetype = 2) +
-  geom_boxplot() +
-  geom_jitter(width = 0.2) +
-  scale_x_discrete(breaks = c("141","522co141",
-                                 "702co141","717co141","733co141"),
-                   labels = c(expression(italic("Sino. ")~only),
-                              expression(Co- ~italic("Pa. ")~522),
-                              expression(Co- ~italic("Ps. ")~"702A"),
-                              expression(Co- ~italic("Ba. ")~"717A"),
-                              expression(Co- ~italic("Ps. ")~"733B")
-                              )
-                   ) +
-  labs(x = "Inoculation treatment", y = "Nodule number (no.)") +
-  ## annotations
-  ### 1 vs 2
-  annotate("segment", x = 1, xend = 2, y = 65, yend = 65, size = 2) + ## horizontal
-  annotate("segment", x = 1, xend = 1, y = 66, yend = 60, size = 2) + ## vertical cap
-  annotate("segment", x = 2, xend = 2, y = 66, yend = 60, size = 2) + ## vertical cap
-  annotate("text", x = 1.5, y = 70, label = "NS", size = 5) + ## text
-  ### 1 vs 3
-  annotate("segment", x = 1, xend = 3, y = 75, yend = 75, size = 2) + ## horizontal
-  annotate("segment", x = 1, xend = 1, y = 76, yend = 70, size = 2) + ## vertical cap
-  annotate("segment", x = 3, xend = 3, y = 76, yend = 70, size = 2) + ## vertical cap
-  annotate("text", x = 2, y = 80, label = "NS", size = 5) + ## text
-  ### 1 vs 4
-  annotate("segment", x = 1, xend = 4, y = 85, yend = 85, size = 2) + ## horizontal
-  annotate("segment", x = 1, xend = 1, y = 86, yend = 80, size = 2) + ## vertical cap
-  annotate("segment", x = 4, xend = 4, y = 86, yend = 80, size = 2) + ## vertical cap
-  annotate("text", x = 2.5, y = 90, label = "p = 0.0359", size = 5) + ## text
-  ### 1 vs 5
-  annotate("segment", x = 1, xend = 5, y = 95, yend = 95, size = 2) + ## horizontal
-  annotate("segment", x = 1, xend = 1, y = 96, yend = 90, size = 2) + ## vertical cap
-  annotate("segment", x = 5, xend = 5, y = 96, yend = 90, size = 2) + ## vertical cap
-  annotate("text", x = 3, y = 100, label = "p = 0.0181", size = 5) + ## text
+  labs(x = "Coinoculation treatment", 
+       y = "Difference in EM mean value") +
+  scale_x_discrete(breaks = c("522co141 - 141", "702co141 - 141",
+                              "717co141 - 141","733co141 - 141"),
+                   labels = c(expression(~italic("Pa.")~522),
+                              expression(~italic("Ps.")~"702A"),
+                              expression(~italic("Ba.")~"717A"),
+                              expression(~italic("Ps.")~"733B")
+                              )) +
   ## themes
   theme_bw() +
   theme(axis.title = element_text(size = 16),
         axis.text = element_text(size = 14),
         panel.grid.major = element_blank(),
-        panel.grid.minor = element_blank())
-)
-
-## combine res_vs_fits plot
-fig <- plot_grid(p1, p2,
-          ncol = 1,
-          nrow = 2,
-          rel_heights = c(0.8,1),
-          align = "v",
-          labels = c("A","B"))
+        panel.grid.minor = element_blank(),
+        strip.text.x = element_text(size = 16, face = "bold"))
 
 ## save plot
 save_plot("./treated/Fig2.png", fig,
           ncol = 1, 
           nrow = 2,
-          base_aspect_ratio = 2.5)
+          base_aspect_ratio = 1.3)
+fig
 ```
 
 ## N addition experiment (Spring 2022)
